@@ -89,6 +89,11 @@ Drill into individual risk signals: loitering events, RFMO status, flag changes,
 
 ![Amber Alert Risk Signals](docs/screenshots/vessel-detail-amber.png)
 
+### PDF Incident Report
+Generate downloadable incident reports with vessel profile, RFMO status, event timeline, and score breakdown.
+
+![Incident Report](docs/screenshots/incident-report.png)
+
 ---
 
 ## Tech Stack
