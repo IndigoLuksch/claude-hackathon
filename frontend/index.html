@@ -287,6 +287,8 @@
     map: null
   };
 
+  let map; // global reference so all functions can access it
+
   // Fetch Mapbox token from backend, then initialize map
   (async function init() {
     let token = "";
@@ -295,7 +297,6 @@
       const cfg = await res.json();
       token = cfg.mapbox_token || "";
     } catch (_) {}
-    // Fallback to meta tag if backend doesn't provide
     if (!token) {
       const meta = document.querySelector('meta[name="mapbox-token"]');
       token = (meta?.getAttribute("content") || "").trim();
@@ -306,7 +307,7 @@
     }
     mapboxgl.accessToken = token;
 
-    const map = new mapboxgl.Map({
+    map = new mapboxgl.Map({
       container: "map",
       style: "mapbox://styles/mapbox/dark-v11",
       center: [0, 0],
