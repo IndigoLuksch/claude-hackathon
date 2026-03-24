@@ -14,3 +14,5 @@ build/
 .claude /
 node_modules/
 *.log
+.pytest_cache/
+*.docx
