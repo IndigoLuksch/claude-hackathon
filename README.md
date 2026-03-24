@@ -89,6 +89,11 @@ Drill into individual risk signals: loitering events, RFMO status, flag changes,
 
 ![Amber Alert Risk Signals](docs/screenshots/vessel-detail-amber.png)
 
+### AI Intelligence Brief + Chat
+Claude generates a structured risk assessment and answers follow-up questions about enforcement actions, jurisdiction, and next steps.
+
+![AI Chat](docs/screenshots/ai-chat.png)
+
 ### PDF Incident Report
 Generate downloadable incident reports with vessel profile, RFMO status, event timeline, and score breakdown.
 
