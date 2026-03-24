@@ -187,15 +187,6 @@
 
 <script>
   const API_BASE = window.location.origin;
-  const tokenMeta = document.querySelector('meta[name="mapbox-token"]');
-  const rawToken = (tokenMeta?.getAttribute("content") || tokenMeta?.dataset?.token || "");
-  const token = rawToken.trim();
-  const tokenIsPlaceholder = token.toUpperCase() === "YOUR_TOKEN_HERE";
-  const tokenLooksValid = token.startsWith("pk.") || token.startsWith("sk.");
-  if (!token || tokenIsPlaceholder || !tokenLooksValid) {
-    alert("Please set your Mapbox token in the meta tag.");
-  }
-  mapboxgl.accessToken = token;
 
   const state = {
     vessels: [],
@@ -205,13 +196,51 @@
     map: null
   };
 
-  const map = new mapboxgl.Map({
-    container: "map",
-    style: "mapbox://styles/mapbox/dark-v11",
-    center: [0, 0],
-    zoom: 2
-  });
-  state.map = map;
+  // Fetch Mapbox token from backend, then initialize map
+  (async function init() {
+    let token = "";
+    try {
+      const res = await fetch(`${API_BASE}/config`);
+      const cfg = await res.json();
+      token = cfg.mapbox_token || "";
+    } catch (_) {}
+    // Fallback to meta tag if backend doesn't provide
+    if (!token) {
+      const meta = document.querySelector('meta[name="mapbox-token"]');
+      token = (meta?.getAttribute("content") || "").trim();
+    }
+    if (!token || !token.startsWith("pk.")) {
+      document.getElementById("map").innerHTML = '<div style="color:#ff4d4f;padding:40px;text-align:center;">Mapbox token not configured. Set MAPBOX_TOKEN in .env</div>';
+      return;
+    }
+    mapboxgl.accessToken = token;
+
+    const map = new mapboxgl.Map({
+      container: "map",
+      style: "mapbox://styles/mapbox/dark-v11",
+      center: [0, 0],
+      zoom: 2,
+      projection: "globe"
+    });
+    state.map = map;
+
+    map.on("style.load", () => {
+      map.setFog({
+        color: "rgb(10, 14, 20)",
+        "high-color": "rgb(20, 30, 60)",
+        "horizon-blend": 0.08,
+        "space-color": "rgb(8, 10, 16)",
+        "star-intensity": 0.4
+      });
+    });
+
+    map.on("load", async () => {
+      wireTabs();
+      await loadMpaZones();
+      await loadAlerts();
+      await loadTrails();
+    });
+  })();
 
   function tierColor(tier) {
     if (tier === "red") return "#ff4d4f";
@@ -592,7 +621,7 @@
     btn.textContent = "Fetching…";
     sub.textContent = "Pulling new vessels from GFW…";
     try {
-      const res = await fetch(`${API_BASE}/ingest?limit=20`, { method: "POST" });
+      const res = await fetch(`${API_BASE}/ingest?limit=30&query=fishing`, { method: "POST" });
       const data = await res.json();
       if (data.status === "ok") {
         sub.textContent = `Loaded ${data.vessels} vessels — last updated ${new Date().toLocaleTimeString()}`;
@@ -611,12 +640,6 @@
     }
   }
 
-  map.on("load", async () => {
-    wireTabs();
-    await loadMpaZones();
-    await loadAlerts();
-    await loadTrails();
-  });
 </script>
 </body>
 </html>

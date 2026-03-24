@@ -1,3 +1,4 @@
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -33,6 +34,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.get("/config")
+async def get_config():
+    return {"mapbox_token": os.getenv("MAPBOX_TOKEN", "")}
+
 
 app.include_router(ingest.router)
 app.include_router(vessels.router)

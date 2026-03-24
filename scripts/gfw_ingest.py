@@ -112,15 +112,15 @@ async def fetch_vessels(
 ) -> list[dict]:
     """Fetch vessels. limit=0 means fetch all available."""
     if query:
-        # Query mode allows up to 500 per page; paginate with `since`.
-        page_size = 500
+        # GFW API max is 50 per page; paginate with `since`.
+        page_size = 50
         params: dict = {"datasets[0]": VESSELS_DATASET, "limit": page_size, "query": query}
         all_entries: list[dict] = []
         while True:
             r = await client.get(f"{GFW_BASE}/vessels/search", params=params, headers=_headers())
             if r.is_error:
                 log.error("vessels/search %d: %s", r.status_code, r.text)
-            r.raise_for_status()
+                break
             data = r.json()
             entries = data.get("entries", [])
             all_entries.extend(entries)
@@ -190,7 +190,7 @@ async def fetch_events(
             r = await client.get(f"{GFW_BASE}/events", params=params, headers=_headers())
             if r.is_error:
                 log.error("events %d: %s", r.status_code, r.text)
-            r.raise_for_status()
+                break
             
             entries = r.json().get("entries", [])
             all_events.extend(entries)
