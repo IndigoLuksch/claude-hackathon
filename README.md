@@ -1,5 +1,14 @@
 # DarkFleet
 
+![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-0.111-009688?logo=fastapi&logoColor=white)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-4169E1?logo=postgresql&logoColor=white)
+![PostGIS](https://img.shields.io/badge/PostGIS-3.4-5A9E4B?logo=postgresql&logoColor=white)
+![Claude AI](https://img.shields.io/badge/Claude_AI-Sonnet-D97706?logo=anthropic&logoColor=white)
+![Mapbox](https://img.shields.io/badge/Mapbox_GL-3.3-000000?logo=mapbox&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)
+![License](https://img.shields.io/badge/License-MIT-green)
+
 **AI-powered maritime surveillance that catches illegal fishing vessels before they disappear.**
 
 IUU (Illegal, Unreported, and Unregulated) fishing is a **$23 billion** criminal enterprise destroying ocean ecosystems. Evidence exists across disconnected databases — satellite AIS tracking, marine protected area boundaries, RFMO registries, vessel ownership records, sanctions lists — but no single agency monitors them all.
