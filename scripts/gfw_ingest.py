@@ -298,12 +298,14 @@ async def upsert_vessels(session, rows: list[dict]) -> None:
     await session.execute(stmt)
 
 
-async def upsert_events(session, rows: list[dict]) -> None:
+async def upsert_events(session, rows: list[dict], batch_size: int = 500) -> None:
     if not rows:
         return
-    stmt = pg_insert(Event).values(rows)
-    stmt = stmt.on_conflict_do_nothing(index_elements=["id"])
-    await session.execute(stmt)
+    for i in range(0, len(rows), batch_size):
+        batch = rows[i : i + batch_size]
+        stmt = pg_insert(Event).values(batch)
+        stmt = stmt.on_conflict_do_nothing(index_elements=["id"])
+        await session.execute(stmt)
 
 
 # ---- Main -------------------------------------------------------------------
