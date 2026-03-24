@@ -1,0 +1,273 @@
+from __future__ import annotations
+
+import json
+from datetime import datetime, timedelta, timezone
+from io import BytesIO
+from typing import Any, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Response
+from jinja2 import BaseLoader, Environment, select_autoescape
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.database import get_db
+from app.models import Vessel
+from app.scoring import build_signal_details
+
+router = APIRouter(tags=["reports"])
+
+
+_SQL_EVENTS_90D = text(
+    """
+    SELECT event_type, timestamp, lat, lon, details_json
+    FROM events
+    WHERE vessel_mmsi = :mmsi
+      AND timestamp >= :since_ts
+    ORDER BY timestamp ASC NULLS LAST
+"""
+)
+
+_SQL_ALL_RFMOS = text("SELECT DISTINCT rfmo_name FROM rfmo_authorised ORDER BY rfmo_name")
+_SQL_VESSEL_RFMOS = text(
+    """
+    SELECT rfmo_name, authorised_zone
+    FROM rfmo_authorised
+    WHERE mmsi = :mmsi
+       OR (CAST(:imo AS text) IS NOT NULL AND imo = :imo)
+"""
+)
+
+
+
+_TEMPLATE = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>DarkFleet Incident Report</title>
+  <style>
+    body { font-family: Arial, sans-serif; font-size: 12px; color: #1d1d1d; margin: 0; }
+    .header { background: #1F4E79; color: #fff; padding: 20px 24px; }
+    .header h1 { margin: 0 0 8px 0; font-size: 24px; }
+    .meta { font-size: 12px; opacity: 0.95; }
+    .container { padding: 18px 24px 80px 24px; }
+    h2 { border-bottom: 2px solid #e5e7eb; padding-bottom: 6px; margin-top: 24px; margin-bottom: 10px; color: #1F4E79; }
+    table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+    th, td { border: 1px solid #d1d5db; padding: 8px; text-align: left; vertical-align: top; }
+    th { background: #f3f4f6; }
+    tr:nth-child(even) td { background: #f8fafc; }
+    .tier-pill { padding: 4px 10px; border-radius: 999px; color: #fff; font-weight: bold; display: inline-block; text-transform: uppercase; }
+    .tier-red { background: #c62828; }
+    .tier-amber { background: #ef6c00; }
+    .tier-green { background: #2e7d32; }
+    .muted { color: #6b7280; }
+    .footer { position: fixed; bottom: 0; left: 0; right: 0; border-top: 1px solid #d1d5db; background: #fff; font-size: 11px; color: #4b5563; padding: 10px 24px; }
+    .small { font-size: 11px; }
+    pre { margin: 0; white-space: pre-wrap; word-break: break-word; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>DarkFleet Incident Report</h1>
+    <div class="meta">
+      Generated: {{ generated_at }}<br/>
+      Vessel: {{ vessel.mmsi }}{% if vessel.name %} / {{ vessel.name }}{% endif %}{% if vessel.flag_state %} / {{ vessel.flag_state }}{% endif %}
+    </div>
+  </div>
+
+  <div class="container">
+    <h2>Section 1 — Vessel profile</h2>
+    <table>
+      <tr><th>MMSI</th><td>{{ vessel.mmsi }}</td><th>IMO</th><td>{{ vessel.imo or "-" }}</td></tr>
+      <tr><th>Flag state</th><td>{{ vessel.flag_state or "-" }}</td><th>Gear type</th><td>{{ vessel.gear_type or "-" }}</td></tr>
+      <tr><th>Last seen</th><td>{{ vessel.last_seen or "-" }}</td><th>Risk score</th><td>{{ vessel.risk_score }}</td></tr>
+      <tr>
+        <th>Alert tier</th>
+        <td colspan="3">
+          <span class="tier-pill {{ tier_class }}">{{ vessel.alert_tier }}</span>
+        </td>
+      </tr>
+    </table>
+
+    <h2>Section 2 — RFMO authorisation status</h2>
+    <table>
+      <thead>
+        <tr><th>RFMO name</th><th>Authorised</th><th>Zone</th></tr>
+      </thead>
+      <tbody>
+      {% if rfmo_rows %}
+        {% for row in rfmo_rows %}
+          <tr>
+            <td>{{ row.rfmo_name }}</td>
+            <td>{{ "Yes" if row.authorised else "No" }}</td>
+            <td>{{ row.zone }}</td>
+          </tr>
+        {% endfor %}
+      {% else %}
+        <tr><td colspan="3" class="muted">No RFMO records found.</td></tr>
+      {% endif %}
+      </tbody>
+    </table>
+
+    <h2>Section 3 — Event timeline</h2>
+    <table>
+      <thead>
+        <tr><th>Event type</th><th>Timestamp</th><th>Lat</th><th>Lon</th><th>Details</th></tr>
+      </thead>
+      <tbody>
+      {% if events %}
+        {% for e in events %}
+          <tr>
+            <td>{{ e.event_type }}</td>
+            <td>{{ e.timestamp }}</td>
+            <td>{{ e.lat }}</td>
+            <td>{{ e.lon }}</td>
+            <td><pre class="small">{{ e.details }}</pre></td>
+          </tr>
+        {% endfor %}
+      {% else %}
+        <tr><td colspan="5" class="muted">No events in the past 90 days.</td></tr>
+      {% endif %}
+      </tbody>
+    </table>
+
+    <h2>Section 4 — Score breakdown</h2>
+    <table>
+      <thead>
+        <tr><th>Signal</th><th>Triggered</th><th>Point contribution</th></tr>
+      </thead>
+      <tbody>
+        {% for row in score_breakdown %}
+          <tr>
+            <td>{{ row.signal }}</td>
+            <td>{{ "Yes" if row.triggered else "No" }}</td>
+            <td>{{ row.points }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="footer">
+    Generated by DarkFleet · Data sourced from Global Fishing Watch, WDPA, RFMO registries
+  </div>
+</body>
+</html>
+"""
+
+
+def _dt_iso(value: Optional[datetime]) -> str:
+    if value is None:
+        return "-"
+    return value.astimezone(timezone.utc).isoformat()
+
+
+
+
+async def _build_report_context(mmsi: str, db: AsyncSession) -> dict[str, Any]:
+    vessel = await db.get(Vessel, mmsi)
+    if vessel is None:
+        raise HTTPException(status_code=404, detail=f"Vessel {mmsi} not found")
+
+    since_ts = datetime.now(timezone.utc) - timedelta(days=90)
+    event_rows = (
+        await db.execute(
+            _SQL_EVENTS_90D,
+            {"mmsi": mmsi, "since_ts": since_ts},
+        )
+    ).mappings().all()
+
+    events = [
+        {
+            "event_type": row["event_type"],
+            "timestamp": _dt_iso(row["timestamp"]),
+            "lat": row["lat"] if row["lat"] is not None else "-",
+            "lon": row["lon"] if row["lon"] is not None else "-",
+            "details": json.dumps(row["details_json"] or {}, indent=2, sort_keys=True),
+        }
+        for row in event_rows
+    ]
+
+    all_rfmos = [r[0] for r in (await db.execute(_SQL_ALL_RFMOS)).all()]
+    vessel_rfmo_rows = (
+        await db.execute(_SQL_VESSEL_RFMOS, {"mmsi": vessel.mmsi, "imo": vessel.imo})
+    ).mappings().all()
+    authorised_by_rfmo: dict[str, str] = {}
+    for row in vessel_rfmo_rows:
+        if row["rfmo_name"] not in authorised_by_rfmo:
+            authorised_by_rfmo[row["rfmo_name"]] = row["authorised_zone"] or "-"
+
+    rfmo_rows = [
+        {
+            "rfmo_name": rfmo_name,
+            "authorised": rfmo_name in authorised_by_rfmo,
+            "zone": authorised_by_rfmo.get(rfmo_name, "-"),
+        }
+        for rfmo_name in all_rfmos
+    ]
+
+    score_breakdown = await build_signal_details(vessel, db)
+    tier_normalized = (vessel.alert_tier or "").lower()
+    tier_class = "tier-green"
+    if tier_normalized == "red":
+        tier_class = "tier-red"
+    elif tier_normalized == "amber":
+        tier_class = "tier-amber"
+
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "vessel": {
+            "mmsi": vessel.mmsi,
+            "imo": vessel.imo,
+            "name": vessel.name,
+            "flag_state": vessel.flag_state,
+            "gear_type": vessel.gear_type,
+            "last_seen": _dt_iso(vessel.last_seen),
+            "risk_score": vessel.risk_score,
+            "alert_tier": vessel.alert_tier,
+        },
+        "events": events,
+        "rfmo_rows": rfmo_rows,
+        "score_breakdown": score_breakdown,
+        "tier_class": tier_class,
+    }
+
+
+def _render_html(context: dict[str, Any]) -> str:
+    env = Environment(loader=BaseLoader(), autoescape=select_autoescape(["html", "xml"]))
+    template = env.from_string(_TEMPLATE)
+    return template.render(**context)
+
+
+@router.get("/vessels/{mmsi}/signals")
+async def vessel_signals(mmsi: str, db: AsyncSession = Depends(get_db)) -> list[dict]:
+    vessel = await db.get(Vessel, mmsi)
+    if vessel is None:
+        raise HTTPException(status_code=404, detail=f"Vessel {mmsi} not found")
+    return await build_signal_details(vessel, db)
+
+
+@router.get("/report/{mmsi}/html", response_class=Response)
+async def incident_report_html(mmsi: str, db: AsyncSession = Depends(get_db)) -> Response:
+    context = await _build_report_context(mmsi, db)
+    html = _render_html(context)
+    return Response(content=html, media_type="text/html")
+
+
+@router.get("/report/{mmsi}")
+async def incident_report_pdf(mmsi: str, db: AsyncSession = Depends(get_db)) -> Response:
+    context = await _build_report_context(mmsi, db)
+    html = _render_html(context)
+    try:
+        from weasyprint import HTML
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=500,
+            detail="PDF generation dependency not available (WeasyPrint system libraries missing).",
+        ) from exc
+
+    out = BytesIO()
+    HTML(string=html).write_pdf(out)
+
+    filename = f"darkfleet_incident_report_{mmsi}.pdf"
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    return Response(content=out.getvalue(), media_type="application/pdf", headers=headers)

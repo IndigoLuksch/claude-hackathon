@@ -1,0 +1,622 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <!-- Set your Mapbox public token (pk.*) for local use; do not commit real tokens. -->
+  <meta name="mapbox-token" content="" />
+  <title>DarkFleet Maritime Surveillance</title>
+  <link href="https://api.mapbox.com/mapbox-gl-js/v3.3.0/mapbox-gl.css" rel="stylesheet" />
+  <script src="https://api.mapbox.com/mapbox-gl-js/v3.3.0/mapbox-gl.js"></script>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --text: #e6edf3;
+      --accent: #1a6aff;
+      --card: #161b22;
+      --border: #30363d;
+      --muted: #8b949e;
+      --red: #ff4d4f;
+      --amber: #ff9f1a;
+      --clear: #6e7681;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; font-family: Inter, Segoe UI, Arial, sans-serif; background: var(--bg); color: var(--text); }
+    #app { position: relative; width: 100%; height: 100%; overflow: hidden; }
+    #map { position: absolute; inset: 0; }
+
+    .panel {
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      z-index: 10;
+      backdrop-filter: blur(2px);
+      background: var(--bg);
+      border-right: 1px solid var(--border);
+    }
+    #sidebar { left: 0; width: 300px; display: flex; flex-direction: column; }
+    #details { right: 0; width: 350px; border-right: none; border-left: 1px solid var(--border); padding: 16px; overflow-y: auto; }
+
+    .panel-header {
+      padding: 14px 14px 10px;
+      border-bottom: 1px solid var(--border);
+      background: #0f141b;
+    }
+    .title-row { display: flex; align-items: center; justify-content: space-between; margin: 0 0 8px; }
+    .title { margin: 0; font-size: 16px; letter-spacing: 0.2px; }
+    .subtitle { margin: 0; color: var(--muted); font-size: 12px; }
+    .reload-btn {
+      border: 1px solid var(--border);
+      background: #111823;
+      color: var(--text);
+      border-radius: 6px;
+      padding: 4px 10px;
+      cursor: pointer;
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .reload-btn:hover:not(:disabled) { border-color: var(--accent); }
+    .reload-btn:disabled { opacity: 0.45; cursor: default; }
+
+    .tabs { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-top: 12px; }
+    .tab {
+      border: 1px solid var(--border);
+      background: #111823;
+      color: var(--text);
+      padding: 6px 8px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 12px;
+    }
+    .tab.active { border-color: var(--accent); background: rgba(26, 106, 255, 0.22); }
+
+    #vessel-list { overflow-y: auto; padding: 10px; display: flex; flex-direction: column; gap: 8px; scrollbar-color: var(--border) transparent; scrollbar-width: thin; }
+    #vessel-list::-webkit-scrollbar { width: 6px; }
+    #vessel-list::-webkit-scrollbar-track { background: transparent; }
+    #vessel-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+    #vessel-list::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px;
+      cursor: pointer;
+    }
+    .card:hover { border-color: var(--accent); }
+    .card-top { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+    .card-name { font-size: 14px; font-weight: 600; margin: 0; }
+    .card-line { margin: 6px 0 0; font-size: 12px; color: var(--muted); }
+    .badge {
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      color: #fff;
+    }
+    .badge.red { background: var(--red); }
+    .badge.amber { background: var(--amber); }
+    .badge.clear { background: var(--clear); }
+
+    .empty { color: var(--muted); font-size: 13px; padding: 8px 2px; }
+    .detail-title { margin: 0 0 6px; font-size: 20px; }
+    .detail-mmsi { margin: 0 0 12px; color: var(--muted); font-size: 13px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 12px; }
+    .kv { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 8px; }
+    .kv label { display: block; color: var(--muted); font-size: 11px; margin-bottom: 4px; }
+    .kv div { font-size: 13px; }
+    .score-wrap { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
+    .score-ring {
+      width: 88px;
+      height: 88px;
+      border-radius: 50%;
+      display: grid;
+      place-items: center;
+      background: conic-gradient(var(--accent) 0deg, #1f2937 0deg);
+      position: relative;
+    }
+    .score-ring::after {
+      content: "";
+      width: 66px;
+      height: 66px;
+      border-radius: 50%;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      position: absolute;
+    }
+    .score-value {
+      position: relative;
+      z-index: 1;
+      font-size: 22px;
+      font-weight: 700;
+    }
+    .actions { display: grid; gap: 8px; margin-bottom: 14px; }
+    .btn {
+      border: 1px solid var(--border);
+      background: #13203a;
+      color: var(--text);
+      border-radius: 8px;
+      padding: 10px 12px;
+      cursor: pointer;
+      text-align: center;
+      text-decoration: none;
+      font-size: 13px;
+      font-weight: 600;
+    }
+    .btn:hover { border-color: var(--accent); }
+    .signals { display: flex; flex-direction: column; gap: 4px; margin-bottom: 14px; }
+    .signal-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; font-size: 12px; }
+    .signal-row.triggered { border-color: #ff4d4f44; background: #ff4d4f0d; }
+    .signal-name { color: var(--muted); flex: 1; }
+    .signal-row.triggered .signal-name { color: var(--text); }
+    .signal-pts { font-weight: 700; color: var(--muted); white-space: nowrap; }
+    .signal-row.triggered .signal-pts { color: #ff4d4f; }
+    .events { display: flex; flex-direction: column; gap: 8px; }
+    .event-item { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 8px; }
+    .event-item p { margin: 2px 0; font-size: 12px; color: var(--muted); }
+    .event-item strong { color: var(--text); }
+    .mapboxgl-popup-content { background: #111823; color: var(--text); border: 1px solid var(--border); }
+  </style>
+</head>
+<body>
+<div id="app">
+  <div id="map"></div>
+
+  <aside id="sidebar" class="panel">
+    <div class="panel-header">
+      <div class="title-row">
+        <h1 class="title">DarkFleet Control</h1>
+        <button class="reload-btn" id="reload-btn" onclick="reloadShips()">Reload ships</button>
+      </div>
+      <p class="subtitle" id="reload-subtitle">Maritime surveillance dashboard</p>
+      <div class="tabs" id="filter-tabs">
+        <button class="tab active" data-tier="all">All</button>
+        <button class="tab" data-tier="red">Red</button>
+        <button class="tab" data-tier="amber">Amber</button>
+        <button class="tab" data-tier="clear">Clear</button>
+      </div>
+    </div>
+    <div id="vessel-list"></div>
+  </aside>
+
+  <aside id="details" class="panel">
+    <h2 class="detail-title">No vessel selected</h2>
+    <p class="detail-mmsi">Pick a vessel from the map or list.</p>
+  </aside>
+</div>
+
+<script>
+  const API_BASE = "http://localhost:8000";
+  const tokenMeta = document.querySelector('meta[name="mapbox-token"]');
+  const rawToken = (tokenMeta?.getAttribute("content") || tokenMeta?.dataset?.token || "");
+  const token = rawToken.trim();
+  const tokenIsPlaceholder = token.toUpperCase() === "YOUR_TOKEN_HERE";
+  const tokenLooksValid = token.startsWith("pk.") || token.startsWith("sk.");
+  if (!token || tokenIsPlaceholder || !tokenLooksValid) {
+    alert("Please set your Mapbox token in the meta tag.");
+  }
+  mapboxgl.accessToken = token;
+
+  const state = {
+    vessels: [],
+    trails: null,
+    filteredTier: "all",
+    selectedMmsi: null,
+    map: null
+  };
+
+  const map = new mapboxgl.Map({
+    container: "map",
+    style: "mapbox://styles/mapbox/dark-v11",
+    center: [0, 0],
+    zoom: 2
+  });
+  state.map = map;
+
+  function tierColor(tier) {
+    if (tier === "red") return "#ff4d4f";
+    if (tier === "amber") return "#ff9f1a";
+    return "#6e7681";
+  }
+
+  function radiusFromRisk(score) {
+    const v = Math.max(0, Math.min(100, Number(score) || 0));
+    return 6 + (v / 100) * 12;
+  }
+
+  function flagEmoji(code) {
+    if (!code || code.length !== 2) return "🏳️";
+    return code.toUpperCase().replace(/./g, (c) => String.fromCodePoint(127397 + c.charCodeAt(0)));
+  }
+
+  function formatDate(iso) {
+    if (!iso) return "-";
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return iso;
+    return d.toLocaleString();
+  }
+
+  function vesselMatchesFilter(v) {
+    return state.filteredTier === "all" ? true : (v.alert_tier || "clear") === state.filteredTier;
+  }
+
+  function renderVesselList() {
+    const list = document.getElementById("vessel-list");
+    list.innerHTML = "";
+    const filtered = state.vessels.filter(vesselMatchesFilter);
+
+    if (!filtered.length) {
+      const div = document.createElement("div");
+      div.className = "empty";
+      div.textContent = "No vessels match this filter.";
+      list.appendChild(div);
+      return;
+    }
+
+    filtered.forEach((v) => {
+      const card = document.createElement("div");
+      card.className = "card";
+      card.dataset.mmsi = v.mmsi;
+      card.innerHTML = `
+        <div class="card-top">
+          <p class="card-name">${v.name || "Unknown Vessel"}</p>
+          <span class="badge ${(v.alert_tier || "clear")}">${v.alert_tier || "clear"}</span>
+        </div>
+        <p class="card-line">MMSI: ${v.mmsi}</p>
+        <p class="card-line">${flagEmoji(v.flag_state)} ${v.flag_state || "-"} · Risk: ${(Number(v.risk_score) || 0).toFixed(1)}</p>
+      `;
+      card.addEventListener("click", () => selectVessel(v.mmsi));
+      list.appendChild(card);
+    });
+  }
+
+  function toFeatureCollection(vessels) {
+    return {
+      type: "FeatureCollection",
+      features: vessels
+        .filter(v => v.most_recent_event && v.most_recent_event.lon != null && v.most_recent_event.lat != null)
+        .filter(vesselMatchesFilter)
+        .map(v => ({
+          type: "Feature",
+          geometry: {
+            type: "Point",
+            coordinates: [v.most_recent_event.lon, v.most_recent_event.lat]
+          },
+          properties: {
+            mmsi: v.mmsi,
+            name: v.name || "Unknown Vessel",
+            alert_tier: v.alert_tier || "clear",
+            risk_score: Number(v.risk_score) || 0
+          }
+        }))
+    };
+  }
+
+  function makePulsingDot(hexColor) {
+    const size = 240;
+    const r = parseInt(hexColor.slice(1, 3), 16);
+    const g = parseInt(hexColor.slice(3, 5), 16);
+    const b = parseInt(hexColor.slice(5, 7), 16);
+    return {
+      width: size, height: size,
+      data: new Uint8Array(size * size * 4),
+      onAdd() {
+        const canvas = document.createElement("canvas");
+        canvas.width = size; canvas.height = size;
+        this.context = canvas.getContext("2d");
+      },
+      render() {
+        const t = (performance.now() % 1800) / 1800;
+        const ctx = this.context;
+        const cx = size / 2, maxR = size / 2 - 1;
+        ctx.clearRect(0, 0, size, size);
+        for (const offset of [0, 0.5]) {
+          const p = (t + offset) % 1;
+          ctx.beginPath();
+          ctx.arc(cx, cx, maxR * p, 0, Math.PI * 2);
+          ctx.strokeStyle = `rgba(${r},${g},${b},${0.85 * (1 - p)})`;
+          ctx.lineWidth = 2;
+          ctx.stroke();
+        }
+        this.data = ctx.getImageData(0, 0, size, size).data;
+        map.triggerRepaint();
+        return true;
+      }
+    };
+  }
+
+  function updateMarkerLayer() {
+    const data = toFeatureCollection(state.vessels);
+    const source = map.getSource("vessels");
+    if (source) {
+      source.setData(data);
+      return;
+    }
+
+    map.addImage("pulse-red",   makePulsingDot("#ff1a1a"), { pixelRatio: 2 });
+    map.addImage("pulse-amber", makePulsingDot("#ff9f1a"), { pixelRatio: 2 });
+
+    map.addSource("vessels", { type: "geojson", data });
+
+    for (const [tier, img] of [["red", "pulse-red"], ["amber", "pulse-amber"]]) {
+      map.addLayer({
+        id: `vessels-pulse-${tier}`,
+        type: "symbol",
+        source: "vessels",
+        filter: ["==", ["get", "alert_tier"], tier],
+        layout: { "icon-image": img, "icon-size": 1, "icon-allow-overlap": true }
+      });
+    }
+
+    map.addLayer({
+      id: "vessels-circles",
+      type: "circle",
+      source: "vessels",
+      paint: {
+        "circle-color": [
+          "match",
+          ["get", "alert_tier"],
+          "red", "#ff4d4f",
+          "amber", "#ff9f1a",
+          "#6e7681"
+        ],
+        "circle-radius": [
+          "interpolate",
+          ["linear"],
+          ["coalesce", ["get", "risk_score"], 0],
+          0, 3,
+          100, 8
+        ],
+        "circle-stroke-color": "#e6edf3",
+        "circle-stroke-width": 1.25
+      }
+    });
+
+    map.on("click", "vessels-circles", (e) => {
+      const feature = e.features && e.features[0];
+      if (!feature) return;
+      const mmsi = feature.properties.mmsi;
+      selectVessel(mmsi);
+    });
+
+    map.on("mouseenter", "vessels-circles", () => { map.getCanvas().style.cursor = "pointer"; });
+    map.on("mouseleave", "vessels-circles", () => { map.getCanvas().style.cursor = ""; });
+  }
+
+  async function renderDetails(v) {
+    const panel = document.getElementById("details");
+    const ringColor = tierColor(v.alert_tier || "clear");
+    const score = Math.max(0, Math.min(100, Number(v.risk_score) || 0));
+    const deg = Math.round((score / 100) * 360);
+
+    let events = [], signals = [];
+    try {
+      const [evRes, sigRes] = await Promise.all([
+        fetch(`${API_BASE}/vessels/${encodeURIComponent(v.mmsi)}/events?limit=5`),
+        fetch(`${API_BASE}/vessels/${encodeURIComponent(v.mmsi)}/signals`),
+      ]);
+      if (evRes.ok) events = await evRes.json();
+      if (sigRes.ok) signals = await sigRes.json();
+    } catch (_) {}
+
+    panel.innerHTML = `
+      <h2 class="detail-title">${v.name || "Unknown Vessel"}</h2>
+      <p class="detail-mmsi">MMSI: ${v.mmsi}</p>
+      <div class="grid">
+        <div class="kv"><label>Flag</label><div>${flagEmoji(v.flag_state)} ${v.flag_state || "-"}</div></div>
+        <div class="kv"><label>Gear type</label><div>${v.gear_type || "-"}</div></div>
+        <div class="kv"><label>Last seen</label><div>${formatDate(v.last_seen)}</div></div>
+        <div class="kv"><label>Alert tier</label><div><span class="badge ${(v.alert_tier || "clear")}">${v.alert_tier || "clear"}</span></div></div>
+      </div>
+      <div class="score-wrap">
+        <div class="score-ring" style="background: conic-gradient(${ringColor} ${deg}deg, #1f2937 ${deg}deg);">
+          <div class="score-value">${score.toFixed(1)}</div>
+        </div>
+        <div>
+          <div style="font-size:13px;color:var(--muted);">Risk score</div>
+          <div style="font-size:24px;font-weight:700;">${score.toFixed(1)}</div>
+        </div>
+      </div>
+      <div class="actions">
+        <a class="btn" href="${API_BASE}/report/${encodeURIComponent(v.mmsi)}" target="_blank" rel="noreferrer">Download Incident Report</a>
+        <a class="btn" href="${API_BASE}/report/${encodeURIComponent(v.mmsi)}/html" target="_blank" rel="noreferrer">Preview Report</a>
+      </div>
+      <h3 style="font-size:14px;margin:4px 0 8px;">Risk Signals</h3>
+      <div class="signals" id="risk-signals"></div>
+      <h3 style="font-size:14px;margin:12px 0 8px;">Recent Events</h3>
+      <div class="events" id="recent-events"></div>
+    `;
+
+    const sigList = panel.querySelector("#risk-signals");
+    if (signals.length) {
+      sigList.innerHTML = signals.map(s => `
+        <div class="signal-row ${s.triggered ? "triggered" : ""}">
+          <span class="signal-name">${s.signal}${s.detail ? ` <span style="opacity:.6">(${s.detail})</span>` : ""}</span>
+          <span class="signal-pts">${s.triggered ? "+" + s.points : "—"}</span>
+        </div>
+      `).join("");
+    } else {
+      sigList.innerHTML = `<div class="empty">No signal data.</div>`;
+    }
+
+    const list = panel.querySelector("#recent-events");
+    if (!events.length) {
+      list.innerHTML = `<div class="empty">No recent events found.</div>`;
+      return;
+    }
+    list.innerHTML = events.map((e) => `
+      <div class="event-item">
+        <p><strong>${e.event_type || "-"}</strong></p>
+        <p>${formatDate(e.timestamp)}</p>
+        <p>Lat: ${e.lat ?? "-"} · Lon: ${e.lon ?? "-"}</p>
+      </div>
+    `).join("");
+  }
+
+  function selectVessel(mmsi) {
+    state.selectedMmsi = mmsi;
+    const vessel = state.vessels.find(v => v.mmsi === mmsi);
+    if (!vessel) return;
+    const pos = vessel.most_recent_event;
+    if (pos && pos.lon != null && pos.lat != null) {
+      map.flyTo({ center: [pos.lon, pos.lat], zoom: Math.max(map.getZoom(), 6), speed: 1.4 });
+    }
+    renderDetails(vessel);
+  }
+
+  function wireTabs() {
+    document.querySelectorAll(".tab").forEach((tab) => {
+      tab.addEventListener("click", () => {
+        document.querySelectorAll(".tab").forEach((x) => x.classList.remove("active"));
+        tab.classList.add("active");
+        state.filteredTier = tab.dataset.tier;
+        renderVesselList();
+        updateMarkerLayer();
+        updateTrailLayer();
+      });
+    });
+  }
+
+  function approxKm(a, b) {
+    const dlat = a[1] - b[1];
+    const dlon = (a[0] - b[0]) * Math.cos((a[1] + b[1]) * Math.PI / 360);
+    return Math.sqrt(dlat * dlat + dlon * dlon) * 111;
+  }
+
+  function trailsToSegments(fc) {
+    const MAX_SEGMENT_KM = 500;
+    const features = [];
+    for (const f of fc.features) {
+      const coords = f.geometry.coordinates;
+      const n = coords.length;
+      if (n < 2) continue;
+      for (let i = 0; i < n - 1; i++) {
+        if (approxKm(coords[i], coords[i + 1]) > MAX_SEGMENT_KM) continue;
+        const progress = n === 2 ? 1 : i / (n - 2);
+        features.push({
+          type: "Feature",
+          geometry: { type: "LineString", coordinates: [coords[i], coords[i + 1]] },
+          properties: { alert_tier: f.properties.alert_tier, opacity: progress * 0.65 }
+        });
+      }
+    }
+    return { type: "FeatureCollection", features };
+  }
+
+  function updateTrailLayer() {
+    if (!state.trails) return;
+    const filtered = {
+      type: "FeatureCollection",
+      features: state.trails.features.filter(f =>
+        state.filteredTier === "all" || f.properties.alert_tier === state.filteredTier
+      )
+    };
+    const segments = trailsToSegments(filtered);
+    const source = map.getSource("vessel-trails");
+    if (source) {
+      source.setData(segments);
+      return;
+    }
+    map.addSource("vessel-trails", { type: "geojson", data: segments });
+    const beforeLayer = map.getLayer("vessels-circles") ? "vessels-circles" : undefined;
+    map.addLayer({
+      id: "vessel-trails-line",
+      type: "line",
+      source: "vessel-trails",
+      layout: { "line-join": "round", "line-cap": "round" },
+      paint: {
+        "line-color": [
+          "match", ["get", "alert_tier"],
+          "red", "#ff4d4f",
+          "amber", "#ff9f1a",
+          "#6e7681"
+        ],
+        "line-width": 1.5,
+        "line-opacity": ["get", "opacity"]
+      }
+    }, beforeLayer);
+  }
+
+  async function loadTrails() {
+    try {
+      const res = await fetch(`${API_BASE}/vessel-trails`);
+      if (res.ok) {
+        state.trails = await res.json();
+        updateTrailLayer();
+      }
+    } catch (_) {}
+  }
+
+  async function loadAlerts() {
+    const res = await fetch(`${API_BASE}/alerts`);
+    if (!res.ok) throw new Error("Failed to load alerts");
+    const data = await res.json();
+    state.vessels = data.sort((a, b) => (Number(b.risk_score) || 0) - (Number(a.risk_score) || 0));
+    renderVesselList();
+    updateMarkerLayer();
+  }
+
+  async function loadMpaZones() {
+    const res = await fetch(`${API_BASE}/mpa`);
+    if (!res.ok) return;
+    const geojson = await res.json();
+    if (!map.getSource("mpa-zones")) {
+      map.addSource("mpa-zones", { type: "geojson", data: geojson });
+      map.addLayer({
+        id: "mpa-fill",
+        type: "fill",
+        source: "mpa-zones",
+        paint: {
+          "fill-color": "#1a6aff",
+          "fill-opacity": 0.15
+        }
+      });
+      map.addLayer({
+        id: "mpa-line",
+        type: "line",
+        source: "mpa-zones",
+        paint: {
+          "line-color": "#1a6aff",
+          "line-width": 1.4
+        }
+      });
+    } else {
+      map.getSource("mpa-zones").setData(geojson);
+    }
+  }
+
+  async function reloadShips() {
+    const btn = document.getElementById("reload-btn");
+    const sub = document.getElementById("reload-subtitle");
+    btn.disabled = true;
+    btn.textContent = "Fetching…";
+    sub.textContent = "Pulling new vessels from GFW…";
+    try {
+      const res = await fetch(`${API_BASE}/ingest`, { method: "POST" });
+      const data = await res.json();
+      if (data.status === "ok") {
+        sub.textContent = `Loaded ${data.vessels} vessels — last updated ${new Date().toLocaleTimeString()}`;
+        await loadAlerts();
+        await loadTrails();
+      } else if (data.status === "already_running") {
+        sub.textContent = "Ingest already running, please wait…";
+      } else {
+        sub.textContent = "Error fetching vessels. Check server logs.";
+      }
+    } catch (_) {
+      sub.textContent = "Network error — is the server running?";
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "Reload ships";
+    }
+  }
+
+  map.on("load", async () => {
+    wireTabs();
+    await loadMpaZones();
+    await loadAlerts();
+    await loadTrails();
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,778 @@
+DARKFLEET — SYSTEMS OVERVIEW
+Production-Ready Maritime Surveillance Platform
+================================================================
+
+This document describes the target architecture for DarkFleet,
+a maritime surveillance system that detects illegal, unreported,
+and unregulated (IUU) fishing by fusing vessel tracking data with
+authoritative registry, blacklist, and inspection databases.
+
+It is written against the current MVP codebase and specifies what
+must change to reach production quality. Every component is
+concrete: named tables, named endpoints, named scripts, named
+signals. If it is not in this document, it is not in scope.
+
+
+================================================================
+1. CURRENT STATE — WHAT EXISTS
+================================================================
+
+Stack
+-----
+  Python 3.12 / FastAPI (async) / SQLAlchemy 2.0 async ORM
+  PostgreSQL 16 + PostGIS 3
+  Mapbox GL JS 3.3.0 (single-page frontend)
+  WeasyPrint for PDF report generation
+
+Database tables (6)
+-------------------
+  vessels            MMSI (PK), IMO, name, flag, gear, risk_score,
+                     alert_tier, flag_history_json, iuu_blacklisted,
+                     blacklist_source, detained_24m, ownership_verified
+  events             GFW event ID (PK), vessel_mmsi, event_type,
+                     timestamp, lat, lon, details_json
+  mpa_zones          PostGIS geometry, name (FAO areas + high seas)
+  rfmo_authorised    MMSI/IMO, rfmo_name, species, zone
+  vessel_ownership   ownership records from GISIS enrichment
+  (alembic_version)  migration tracking (not yet wired)
+
+Ingest scripts (5)
+-------------------
+  scripts/gfw_ingest.py          GFW vessels + events
+  scripts/marine_zones_ingest.py FAO/high-seas polygons via WFS
+  scripts/wdpa_ingest.py         WDPA protected areas from GeoJSON
+  scripts/rfmo_ingest.py         RFMO authorised vessel CSVs
+  scripts/imo_gisis_enrich.py    GISIS ownership (scaffold only)
+
+API routers (6)
+---------------
+  ingest.py    POST /ingest, GET /ingest/status
+  vessels.py   GET /vessels, /vessels/{mmsi}/events, /vessel-trails,
+               /vessels/{mmsi}/ownership
+  scoring.py   POST /score/{mmsi}, /score/all, GET /alerts
+  reports.py   GET /report/{mmsi}, /report/{mmsi}/html,
+               /vessels/{mmsi}/signals
+  mpa.py       GET /mpa
+  enrich.py    POST /enrich/all, /enrich/{mmsi}, GET /enrich/status
+
+Scoring engine (app/scoring.py)
+-------------------------------
+  7 signals, 0-100 scale. Geographic context (PostGIS ST_DWithin
+  and ST_Within) is re-implemented. Encounter/transshipment is
+  weighted highest at 40 pts. RFMO absence at 20 pts. Ownership
+  opacity at 5 pts. OpenSanctions match at 5 pts.
+
+Frontend (frontend/index.html)
+------------------------------
+  Single HTML file. Dark-themed Mapbox map with:
+  - Vessel dots (circle layer, size scaled by risk score)
+  - Pulsing radar rings for amber/red vessels (canvas animation)
+  - Fading trail lines (per-segment opacity, 500 km teleport filter)
+  - Blue fill/outline for MPA zones
+  - Left panel: vessel list with tier filter tabs, reload button
+  - Right panel: vessel details, score ring, signal breakdown,
+    recent events, report download/preview links
+  - Click-to-fly-to-vessel on map
+
+Known deficiencies (why this document exists)
+---------------------------------------------
+  1. No IUU blacklist data loaded — every vessel scores 0 on that
+  2. RFMO table empty — signal returns placeholder 10 pts for all
+  3. Paris MOU detention records not integrated
+  4. FAO HSVAR not integrated
+  5. GISIS enrichment is a scaffold — HTML selectors are guesses
+  6. No peer-comparison baseline in scoring
+  7. No rolling-window normalization (some signals use 90d, some 12m)
+  8. Event pagination fetches max 200 per batch, misses older events
+  9. No Alembic migrations — tables created via metadata.create_all
+  10. Frontend does not display ownership data or blacklist status
+  11. No background task queue — ingest blocks the HTTP response
+
+
+================================================================
+2. DATA SOURCES — COMPLETE INVENTORY
+================================================================
+
+Each source is listed with: what it provides, how to access it,
+what table it populates, and what script handles it.
+
+2.1  Global Fishing Watch API (v3)
+    Provides: vessel identity, fishing events, AIS gap events,
+              loitering events
+    Access:   REST API, bearer token (GFW_API_KEY in .env)
+    Base URL: https://gateway.api.globalfishingwatch.org/v3
+    Datasets: public-global-vessel-identity:latest
+              public-global-fishing-events:latest
+              public-global-gaps-events:latest
+              public-global-loitering-events:latest
+    Tables:   vessels, events
+    Script:   scripts/gfw_ingest.py
+    Status:   WORKING. Needs pagination fix (see 3.1).
+
+2.2  IMO GISIS (Ship Particulars)
+    Provides: registered owner, ship manager, technical manager,
+              flag state, vessel status, gross tonnage
+    Access:   Web scraping. Requires free IMO web account
+              (IMO_GISIS_USERNAME, IMO_GISIS_PASSWORD in .env).
+              ASP.NET WebForms with ViewState. No public API.
+              Login at webaccounts.imo.org, then query
+              gisis.imo.org/Public/SHIPS/Default.aspx?imo={imo}
+    Tables:   vessel_ownership, vessels.ownership_verified
+    Script:   scripts/imo_gisis_enrich.py
+    Status:   SCAFFOLD. HTML selectors need verification against
+              live page. Rate limit to 1 req/sec minimum.
+    Fallback: If GISIS login is unreliable, use the S&P Global
+              IMO number search at imonumbers.lrfairplay.com
+              (free registration, returns basic vessel data).
+
+2.3  FAO HSVAR (High Seas Vessel Authorization Record)
+    Provides: vessels authorized by flag states to fish on high seas
+    Access:   FAO maintains a public database. Download as CSV from
+              https://www.fao.org/fishery/en/collection/hsvar
+              No API — periodic manual download or scrape.
+    Tables:   NEW TABLE: fao_hsvar (see 3.3)
+    Script:   NEW: scripts/fao_hsvar_ingest.py
+    Status:   NOT IMPLEMENTED.
+
+2.4  CCAMLR IUU Vessel List
+    Provides: vessels confirmed as IUU by CCAMLR (Antarctic/Southern
+              Ocean). Hard evidence — these vessels are known illegal.
+    Access:   Published annually as PDF on ccamlr.org/en/compliance/
+              iuu-vessel-lists. Structured data available as a
+              manually maintained CSV/table. Small list (~10-30
+              vessels) — can be maintained as a local CSV file
+              checked into the repo at data/ccamlr_iuu.csv.
+    Tables:   NEW TABLE: iuu_blacklist (see 3.3)
+    Script:   NEW: scripts/iuu_blacklist_ingest.py
+    Status:   NOT IMPLEMENTED. Highest-impact single addition.
+
+2.5  WCPFC IUU Vessel List
+    Provides: IUU vessels identified by WCPFC (Western/Central
+              Pacific). Same authority level as CCAMLR.
+    Access:   Published on wcpfc.int. Available as HTML table or
+              PDF. Small list. Maintain as data/wcpfc_iuu.csv.
+    Tables:   iuu_blacklist (same table as CCAMLR, different source)
+    Script:   scripts/iuu_blacklist_ingest.py (same script, --source flag)
+    Status:   NOT IMPLEMENTED.
+
+2.6  RFMO Authorised Vessel Lists
+    Provides: vessels authorized to fish in RFMO convention areas.
+              Absence from this list for a vessel operating in
+              that area is a strong IUU indicator.
+    Access:   CSV downloads from WCPFC, ICCAT, IOTC, CCAMLR, etc.
+              Each RFMO publishes its own format.
+    Tables:   rfmo_authorised
+    Script:   scripts/rfmo_ingest.py (exists, working)
+    Status:   WORKING but table is empty — no CSVs loaded yet.
+
+2.7  Paris MOU Detention Records
+    Provides: port state control inspection results and detentions.
+              A detention means the vessel was found deficient
+              enough to be held in port. Strong negative signal.
+    Access:   Web search at parismou.org. No bulk download or API.
+              Options: (a) scrape the inspection search form,
+              (b) use the Tokyo MOU equivalent for Asia-Pacific,
+              (c) use Equasis (free registration) which aggregates
+              PSC records from multiple MOUs.
+    Tables:   NEW TABLE: detention_records (see 3.3)
+    Script:   NEW: scripts/psc_ingest.py
+    Status:   NOT IMPLEMENTED. Equasis is the most practical
+              aggregated source but prohibits automated scraping.
+              For hackathon: maintain a local CSV of known
+              detentions at data/detentions.csv loaded via script.
+
+2.8  Marine Regions WFS (FAO areas, high seas, EEZ)
+    Provides: geographic boundaries for scoring context
+    Access:   Open WFS at geo.vliz.be, no auth needed
+    Tables:   mpa_zones
+    Script:   scripts/marine_zones_ingest.py (exists, working)
+    Status:   WORKING. 50 zones loaded.
+
+2.9  WDPA (World Database on Protected Areas)
+    Provides: marine protected area boundaries
+    Access:   GeoJSON download from protectedplanet.net (free,
+              requires account for bulk download)
+    Tables:   mpa_zones
+    Script:   scripts/wdpa_ingest.py (exists, working)
+    Status:   WORKING but not yet loaded — needs GeoJSON file.
+
+2.10 OpenSanctions
+    Provides: sanctioned entities (vessel names, flag states)
+    Access:   JSON bulk download from opensanctions.org (free)
+    Tables:   loaded into memory at startup (no table)
+    Script:   none (loaded by app/scoring.py at import time)
+    Status:   WORKING if opensanctions.json file is present.
+
+
+================================================================
+3. DATABASE SCHEMA — TARGET STATE
+================================================================
+
+3.1  Table: vessels (modify existing)
+     No schema changes needed. Columns iuu_blacklisted,
+     blacklist_source, detained_24m, ownership_verified already
+     added.
+
+3.2  Table: events (modify existing)
+     No schema changes needed.
+
+3.3  New tables
+
+     CREATE TABLE iuu_blacklist (
+         id            SERIAL PRIMARY KEY,
+         imo           VARCHAR(20),
+         mmsi          VARCHAR(20),
+         vessel_name   VARCHAR(500),
+         flag_state    VARCHAR(10),
+         source        VARCHAR(50) NOT NULL,  -- 'CCAMLR', 'WCPFC', 'NEAFC', etc.
+         listed_date   DATE,
+         reason        TEXT,
+         UNIQUE(source, COALESCE(imo, ''), COALESCE(mmsi, ''))
+     );
+     CREATE INDEX ix_iuu_imo ON iuu_blacklist(imo);
+     CREATE INDEX ix_iuu_mmsi ON iuu_blacklist(mmsi);
+
+     CREATE TABLE detention_records (
+         id            SERIAL PRIMARY KEY,
+         imo           VARCHAR(20),
+         mmsi          VARCHAR(20),
+         vessel_name   VARCHAR(500),
+         flag_state    VARCHAR(10),
+         port          VARCHAR(200),
+         detained_date DATE NOT NULL,
+         released_date DATE,
+         deficiencies  TEXT,
+         source        VARCHAR(50) NOT NULL,  -- 'PARIS_MOU', 'TOKYO_MOU', etc.
+         UNIQUE(source, imo, detained_date)
+     );
+     CREATE INDEX ix_detention_imo ON detention_records(imo);
+     CREATE INDEX ix_detention_mmsi ON detention_records(mmsi);
+
+     CREATE TABLE fao_hsvar (
+         id              SERIAL PRIMARY KEY,
+         imo             VARCHAR(20),
+         mmsi            VARCHAR(20),
+         vessel_name     VARCHAR(500),
+         flag_state      VARCHAR(10) NOT NULL,
+         authorization   VARCHAR(200),  -- what they are authorized to do
+         area            VARCHAR(200),  -- where they are authorized
+         valid_from      DATE,
+         valid_to        DATE,
+         UNIQUE(flag_state, COALESCE(imo, ''), COALESCE(mmsi, ''))
+     );
+     CREATE INDEX ix_hsvar_imo ON fao_hsvar(imo);
+     CREATE INDEX ix_hsvar_mmsi ON fao_hsvar(mmsi);
+
+3.4  Migration strategy
+     Wire up Alembic for async migrations:
+       alembic init -t async alembic
+     Configure alembic/env.py to use app.database.Base.metadata.
+     Generate initial migration from current table state, then
+     add migration for the three new tables.
+     init_db() in database.py should run migrations instead of
+     metadata.create_all in production.
+
+
+================================================================
+4. SCORING ENGINE — TARGET DESIGN
+================================================================
+
+The scoring engine computes a 0-100 risk score from 9 weighted
+signals. All temporal signals use a 12-month rolling window.
+The score determines the alert tier:
+  red   >= 80
+  amber >= 60
+  clear <  60
+
+Two signals are hard triggers that override the numeric score:
+  - IUU blacklist match  -> force red, score = 100
+  - Active detention     -> floor at amber, score = max(score, 60)
+
+4.1  Signal table
+
+  #  Signal                         Max pts  Method
+  ---------------------------------------------------------------
+  1  Encounter / transshipment       50      Count ENCOUNTER or
+     (12 months)                             TRANSSHIPMENT events.
+                                             25 pts each, cap at 2.
+                                             Strongest behavioral
+                                             signal — transshipment
+                                             at sea is the primary
+                                             mechanism for laundering
+                                             illegal catch.
+
+  2  AIS dark gaps near MPA/zone     35      Count GAP events >6h
+     (12 months)                             within 50km of any
+                                             mpa_zones geometry
+                                             (PostGIS ST_DWithin).
+                                             15 pts first, 10 pts
+                                             each additional, cap 35.
+
+  3  RFMO authorization absent       25      If rfmo_authorised has
+                                             data AND vessel not in
+                                             it: 25 pts. If table is
+                                             empty: 0 pts (no data,
+                                             no score). If vessel is
+                                             authorized: 0 pts.
+
+  4  Loitering inside MPA/zone       20      Count LOITERING events
+     (12 months)                             >2h inside mpa_zones
+                                             (PostGIS ST_Within).
+                                             10 pts each, cap at 2.
+
+  5  Peer-comparison gap anomaly     15      Compare this vessel's
+     (12 months)                             gap count against the
+                                             average gap count for
+                                             vessels with the same
+                                             gear_type and flag_state.
+                                             If vessel gaps > peer
+                                             avg + 1 stddev: 15 pts.
+                                             If > peer avg: 8 pts.
+                                             Otherwise: 0 pts.
+                                             Requires >= 5 peers to
+                                             activate. Below that
+                                             threshold: skip signal.
+
+  6  Flag state changes              10      Count distinct flags in
+     (12 months)                             flag_history_json within
+                                             12-month window.
+                                             2+ flags: 10 pts.
+                                             1 flag: 0 pts (normal).
+
+  7  Ownership opacity                5      FOC flag AND registry
+                                             not verified via GISIS:
+                                             5 pts. Verified or non-
+                                             FOC: 0 pts.
+
+  8  Sanctions list match             5      OpenSanctions match on
+                                             flag or vessel name.
+
+  9  FAO HSVAR absence               10      If fao_hsvar has data
+     (high seas only)                        AND vessel is operating
+                                             on high seas (last event
+                                             inside a high_seas zone)
+                                             AND not in fao_hsvar:
+                                             10 pts.
+                                             Only activates for
+                                             vessels with high-seas
+                                             activity. Otherwise 0.
+
+  HARD TRIGGERS (override):
+  - IUU blacklist match: score = 100, tier = red, regardless of
+    other signals. Check iuu_blacklist by IMO, MMSI, and fuzzy
+    vessel name.
+  - Detention in last 24 months: score = max(score, 60), tier =
+    at least amber. Check detention_records by IMO or MMSI.
+
+4.2  Peer-comparison implementation
+
+     The peer baseline query:
+
+       SELECT AVG(gap_count) AS avg_gaps,
+              STDDEV_POP(gap_count) AS std_gaps
+       FROM (
+           SELECT v.mmsi,
+                  COUNT(e.id) AS gap_count
+           FROM vessels v
+           LEFT JOIN events e
+                  ON e.vessel_mmsi = v.mmsi
+                 AND e.event_type = 'GAP'
+                 AND COALESCE(
+                       (e.details_json->'gap'->>'durationHours')::float, 0
+                     ) > 6
+                 AND e.timestamp >= NOW() - INTERVAL '12 months'
+           WHERE v.gear_type = :gear_type
+             AND v.flag_state = :flag_state
+           GROUP BY v.mmsi
+       ) peer_gaps
+
+     This runs once per vessel during scoring. For bulk rescoring,
+     precompute the peer stats into a temporary table first:
+
+       CREATE TEMP TABLE peer_gap_stats AS
+       SELECT gear_type, flag_state,
+              AVG(gap_count) AS avg_gaps,
+              STDDEV_POP(gap_count) AS std_gaps,
+              COUNT(*) AS peer_count
+       FROM (
+           SELECT v.mmsi, v.gear_type, v.flag_state,
+                  COUNT(e.id) AS gap_count
+           FROM vessels v
+           LEFT JOIN events e ON ...
+           GROUP BY v.mmsi, v.gear_type, v.flag_state
+       ) t
+       GROUP BY gear_type, flag_state;
+
+     Then join against it during scoring. Drop the temp table
+     after the batch completes.
+
+4.3  Score function signature (app/scoring.py)
+
+     async def score_vessel(mmsi: str, db: AsyncSession,
+                            peer_stats: dict | None = None
+                            ) -> ScoringResult
+
+     ScoringResult is a dataclass:
+       score: float
+       tier: str
+       signals: list[SignalResult]
+       hard_triggers: list[str]   # e.g. ["IUU_BLACKLIST"]
+       overridden: bool           # True if hard trigger applied
+
+     score_and_persist() wraps this and writes to the vessel row.
+     build_signal_details() wraps this and formats for the API.
+
+
+================================================================
+5. INGEST SCRIPTS — TARGET STATE
+================================================================
+
+5.1  scripts/gfw_ingest.py (FIX)
+     Problem: fetch_events paginates with offset but stops after
+     one pass of 200 events per batch. Vessels with >200 events
+     across all three datasets lose older data.
+     Fix: the while loop already paginates (offset += limit,
+     break when len(entries) < limit). Verify this works correctly
+     for large result sets. Increase per-batch limit from 200 to
+     the maximum the API allows (check GFW docs — likely 10000
+     for events endpoint). Add a configurable --events-limit flag.
+
+5.2  scripts/iuu_blacklist_ingest.py (NEW)
+     Purpose: Load CCAMLR and WCPFC IUU vessel lists into the
+     iuu_blacklist table, then set vessels.iuu_blacklisted = true
+     and vessels.blacklist_source for any matching vessel.
+
+     Input: CSV files at data/ccamlr_iuu.csv and data/wcpfc_iuu.csv
+     Format: IMO, MMSI, vessel_name, flag_state, listed_date, reason
+
+     The script:
+       1. Reads CSV(s) specified by --ccamlr and/or --wcpfc flags
+       2. Upserts into iuu_blacklist (ON CONFLICT DO UPDATE)
+       3. Runs a cross-reference query to match iuu_blacklist rows
+          against vessels by IMO, MMSI, or normalized vessel name
+       4. Sets vessels.iuu_blacklisted = true, blacklist_source =
+          source for all matches
+       5. Logs how many vessels were matched
+
+     Name matching: normalize both sides (uppercase, strip
+     punctuation, collapse whitespace) and use trigram similarity
+     (pg_trgm extension, similarity() > 0.7) as a fallback when
+     IMO/MMSI don't match.
+
+     CLI:
+       python scripts/iuu_blacklist_ingest.py \
+         --ccamlr data/ccamlr_iuu.csv \
+         --wcpfc data/wcpfc_iuu.csv
+
+5.3  scripts/fao_hsvar_ingest.py (NEW)
+     Purpose: Load FAO HSVAR data into fao_hsvar table.
+
+     Input: CSV downloaded from FAO (data/fao_hsvar.csv)
+     Format: varies — use flexible column mapping like rfmo_ingest.py
+
+     The script:
+       1. Reads CSV with DictReader
+       2. Maps columns flexibly (candidate column names for IMO,
+          MMSI, flag, authorization, area, valid_from, valid_to)
+       3. Upserts into fao_hsvar
+       4. Logs count
+
+5.4  scripts/psc_ingest.py (NEW)
+     Purpose: Load port state control detention records into
+     detention_records table, then set vessels.detained_24m for
+     any vessel with a detention in the last 24 months.
+
+     Input: CSV at data/detentions.csv (manually compiled from
+     Paris MOU / Tokyo MOU / Equasis public search results)
+     Format: IMO, MMSI, vessel_name, flag_state, port,
+             detained_date, released_date, deficiencies, source
+
+     The script:
+       1. Reads CSV, upserts into detention_records
+       2. Cross-references against vessels by IMO/MMSI
+       3. Sets vessels.detained_24m = true for matches within
+          24 months of now
+       4. Logs matched count
+
+5.5  scripts/imo_gisis_enrich.py (FIX)
+     Current state: scaffold with guessed HTML selectors.
+     Required work:
+       1. Manually inspect the GISIS ship particulars page for
+          a known IMO number (login required) and capture the
+          actual HTML structure
+       2. Update BeautifulSoup selectors to match real page
+       3. Add retry logic with exponential backoff
+       4. Add rate limiting (1 request per 2 seconds minimum)
+       5. Handle session expiry (re-login if redirected to login)
+       6. Test with 5-10 real IMO numbers before running at scale
+
+     Alternative approach if GISIS scraping is unreliable:
+     Use the S&P Global IMO number verification page at
+     imonumbers.lrfairplay.com (free registration, cleaner HTML).
+
+
+================================================================
+6. API ENDPOINTS — TARGET STATE
+================================================================
+
+6.1  Existing endpoints (no changes needed)
+     GET  /vessels                  Paginated vessel list
+     GET  /vessels/{mmsi}/events    Recent events for vessel
+     GET  /vessel-trails            GeoJSON trail lines
+     GET  /mpa                      MPA zones as GeoJSON
+     POST /score/{mmsi}             Rescore single vessel
+     POST /score/all                Rescore all vessels
+     GET  /alerts                   All vessels with latest event
+     GET  /vessels/{mmsi}/signals   Signal breakdown
+     GET  /report/{mmsi}/html       HTML incident report
+     GET  /report/{mmsi}            PDF incident report
+     POST /ingest                   Trigger GFW ingest
+     GET  /ingest/status            Ingest running?
+     POST /enrich/all               Trigger GISIS enrichment
+     POST /enrich/{mmsi}            Enrich single vessel
+     GET  /enrich/status            Enrichment running?
+     GET  /vessels/{mmsi}/ownership  Ownership data
+
+6.2  New endpoints
+
+     GET /vessels/{mmsi}/blacklist
+       Returns IUU blacklist matches for this vessel.
+       Response: { "blacklisted": bool, "entries": [...] }
+       Queries iuu_blacklist by IMO, MMSI, and fuzzy name.
+
+     GET /vessels/{mmsi}/detentions
+       Returns detention records for this vessel.
+       Response: { "detained_24m": bool, "records": [...] }
+       Queries detention_records by IMO or MMSI.
+
+     GET /vessels/{mmsi}/hsvar
+       Returns FAO HSVAR authorization status.
+       Response: { "authorized": bool, "entries": [...] }
+
+     GET /stats/fleet
+       Returns aggregate fleet statistics for the dashboard:
+       { "total_vessels": int,
+         "by_tier": {"red": int, "amber": int, "clear": int},
+         "blacklisted_count": int,
+         "detained_count": int,
+         "avg_risk_score": float,
+         "last_ingest": datetime }
+
+     POST /ingest/blacklists
+       Trigger IUU blacklist ingest (runs iuu_blacklist_ingest.py).
+       Separate from /ingest because data sources are different.
+
+     POST /ingest/detentions
+       Trigger PSC detention ingest.
+
+6.3  Endpoint modifications
+
+     GET /alerts
+       Add to response: iuu_blacklisted, detained_24m,
+       ownership_verified fields from the vessel row.
+
+     GET /vessels/{mmsi}/signals
+       Add IUU blacklist hard trigger and detention hard trigger
+       to the signal list. These appear as special rows with
+       type: "hard_trigger" rather than type: "signal".
+
+     GET /report/{mmsi}/html and GET /report/{mmsi}
+       Add sections:
+         Section 2b — IUU Blacklist Status
+         Section 2c — Port State Control History
+         Section 2d — FAO HSVAR Authorization
+         Section 5  — Ownership & Registry (from vessel_ownership)
+
+
+================================================================
+7. FRONTEND — TARGET CHANGES
+================================================================
+
+The frontend remains a single index.html file. Changes are
+additive — no architectural change needed.
+
+7.1  Vessel cards (left panel)
+     Add visual indicators:
+     - Red "BLACKLISTED" badge if iuu_blacklisted is true
+     - Orange "DETAINED" badge if detained_24m is true
+     - Small lock icon if ownership_verified is true
+
+7.2  Details panel (right panel)
+     Add sections below existing content:
+
+     Ownership & Registry (if data exists):
+       Registered owner, ship manager, flag, status, source,
+       verified date. Fetched from /vessels/{mmsi}/ownership.
+
+     IUU Blacklist Status:
+       If blacklisted: red banner with source and reason.
+       If clear: green "Not on any IUU blacklist" text.
+       Fetched from /vessels/{mmsi}/blacklist.
+
+     Detention History:
+       Table of detention records if any.
+       Fetched from /vessels/{mmsi}/detentions.
+
+7.3  Signal breakdown
+     Hard triggers should render distinctly from normal signals:
+     - Red background, bold text, full-width row
+     - "HARD TRIGGER" label instead of point value
+     - Appears at the top of the signal list
+
+7.4  Fleet statistics bar
+     Add a thin bar above the vessel list showing:
+       Total vessels | Red: N | Amber: N | Blacklisted: N
+     Fetched from /stats/fleet on load.
+
+7.5  Map layer additions
+     No new map layers needed. Existing pulsing dots and trail
+     lines already handle amber/red visualization. Blacklisted
+     vessels will be red-tier due to the hard trigger, so they
+     automatically get the pulsing red animation.
+
+
+================================================================
+8. IMPLEMENTATION ORDER
+================================================================
+
+Ordered by impact and dependency. Each step is independently
+deployable and testable.
+
+Phase 1 — Hard signals (highest impact, least code)
+----------------------------------------------------
+  1. Add iuu_blacklist, detention_records, fao_hsvar models
+     to app/models.py. Run Alembic migration.
+
+  2. Write scripts/iuu_blacklist_ingest.py. Create
+     data/ccamlr_iuu.csv by transcribing the CCAMLR PDF
+     (10-30 rows). Run ingest.
+
+  3. Add IUU hard trigger to scoring engine: if vessel matches
+     iuu_blacklist, score = 100, tier = red, signal list gets
+     a hard_trigger entry.
+
+  4. Write scripts/psc_ingest.py. Create data/detentions.csv
+     with a handful of known detentions. Run ingest.
+
+  5. Add detention hard trigger to scoring engine: if vessel
+     has detention in last 24 months, floor score at 60.
+
+  6. Rescore all vessels. Verify blacklisted vessels are red.
+
+Phase 2 — Scoring improvements
+------------------------------
+  7. Fix RFMO signal: return 0 when table is empty instead of
+     10. Load at least one RFMO CSV (WCPFC is most accessible).
+
+  8. Implement peer-comparison gap signal (#5 in signal table).
+     Add the peer stats query. Wire into scoring.
+
+  9. Add FAO HSVAR signal. Write fao_hsvar_ingest.py. Wire
+     into scoring for high-seas vessels only.
+
+  10. Normalize all temporal windows to 12 months. Verify each
+      SQL query uses NOW() - INTERVAL '12 months'.
+
+Phase 3 — Enrichment and verification
+--------------------------------------
+  11. Fix imo_gisis_enrich.py with real HTML selectors.
+      Test with 5 known IMO numbers. Run on full fleet.
+
+  12. Add /vessels/{mmsi}/blacklist, /detentions, /hsvar
+      endpoints. Wire into frontend details panel.
+
+  13. Add fleet stats endpoint. Wire into frontend.
+
+Phase 4 — Frontend polish
+--------------------------
+  14. Add blacklist/detention badges to vessel cards.
+  15. Add hard trigger rendering to signal breakdown.
+  16. Add ownership section to details panel.
+  17. Add fleet statistics bar.
+
+Phase 5 — Infrastructure
+-------------------------
+  18. Wire Alembic for migrations.
+  19. Replace subprocess-based ingest with background task queue
+      (arq or celery with Redis) so /ingest returns immediately
+      and the frontend polls /ingest/status.
+  20. Add periodic re-ingest schedule (daily GFW, weekly
+      enrichment, monthly blacklist refresh).
+
+
+================================================================
+9. DATA FILE FORMATS
+================================================================
+
+These CSV files live in data/ and are checked into the repo.
+They are the ground truth for hard signals.
+
+9.1  data/ccamlr_iuu.csv
+     IMO,MMSI,vessel_name,flag_state,listed_date,reason
+     7436894,,MERIDIAN 1,KHM,2024-11-01,Fishing in CCAMLR without authorization
+
+9.2  data/wcpfc_iuu.csv
+     IMO,MMSI,vessel_name,flag_state,listed_date,reason
+     (same format as ccamlr)
+
+9.3  data/detentions.csv
+     IMO,MMSI,vessel_name,flag_state,port,detained_date,released_date,deficiencies,source
+     9166981,,EXAMPLE VESSEL,PA,Rotterdam,2025-06-15,2025-06-20,"ISM deficiencies",PARIS_MOU
+
+9.4  data/fao_hsvar.csv
+     IMO,MMSI,vessel_name,flag_state,authorization,area,valid_from,valid_to
+     (column mapping is flexible — see script)
+
+
+================================================================
+10. ENVIRONMENT VARIABLES
+================================================================
+
+Required:
+  GFW_API_KEY              Global Fishing Watch API bearer token
+  DATABASE_URL             PostgreSQL connection string
+                           (default: postgresql+asyncpg://
+                            darkfleet:darkfleet@localhost:5432/darkfleet)
+
+Optional:
+  IMO_GISIS_USERNAME       IMO web account username (for GISIS)
+  IMO_GISIS_PASSWORD       IMO web account password
+  OPENSANCTIONS_PATH       Path to opensanctions.json
+                           (default: opensanctions.json in project root)
+  DYLD_FALLBACK_LIBRARY_PATH  /opt/homebrew/lib (macOS, for WeasyPrint)
+  MAPBOX_TOKEN             Mapbox GL access token (set in HTML meta tag,
+                           not as env var in current implementation)
+
+
+================================================================
+11. RUNNING THE SYSTEM
+================================================================
+
+First-time setup:
+  docker compose up -d              # PostgreSQL
+  pip install -r requirements.txt   # Python deps
+  python scripts/marine_zones_ingest.py           # Load FAO/high seas zones
+  python scripts/iuu_blacklist_ingest.py \
+    --ccamlr data/ccamlr_iuu.csv                  # Load IUU blacklist
+  python scripts/psc_ingest.py \
+    --csv data/detentions.csv                      # Load detentions
+  python scripts/rfmo_ingest.py \
+    --wcpfc path/to/wcpfc_authorised.csv           # Load RFMO data
+  python scripts/gfw_ingest.py --vessel-limit 500  # Initial vessel load
+
+Run the server:
+  DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib \
+  uvicorn app.main:app --reload --port 8000
+
+Open http://localhost:8000 in a browser.
+
+Enrich vessels (after loading):
+  python scripts/imo_gisis_enrich.py --limit 50
+
+Rescore after loading new reference data:
+  curl -X POST http://localhost:8000/score/all
+
+
+================================================================
+END OF DOCUMENT
+================================================================

@@ -1,0 +1,1410 @@
+DARKFLEET v2 — CLEAN-SLATE SYSTEMS OVERVIEW
+================================================================
+
+Maritime surveillance platform for detecting illegal, unreported,
+and unregulated (IUU) fishing. Fuses vessel tracking, registry
+databases, IUU blacklists, and inspection records into a scored
+risk dashboard.
+
+This document is the complete blueprint for building DarkFleet
+from an empty directory. Every table, endpoint, query, script,
+and UI component is specified. No code from v1 is carried over.
+
+
+================================================================
+LESSONS FROM v1 — WHAT TO DO DIFFERENTLY
+================================================================
+
+Problem                              Fix in v2
+-------                              ---------
+No migrations. Tables created via    Alembic from first commit.
+  metadata.create_all. Schema        No create_all in prod.
+  changes required manual ALTER.
+
+Scoring ran 7+ individual SQL        Batch scoring. One CTE query
+  queries per vessel. Rescoring      computes all signal inputs
+  500 vessels = 3500+ queries.       for all vessels at once.
+
+Ingest blocked the HTTP response.    arq task queue (async, Redis-
+  30-minute GFW fetch held the       backed). /ingest returns a
+  connection open.                   job ID; frontend polls status.
+
+All ingest scripts duplicated DB     Shared db module. Scripts
+  setup (engine, session, Base       import get_engine() and
+  import, create_all).               get_session() from one place.
+
+Single 620-line HTML file with       Separate files: index.html,
+  inline CSS and JS. Unmaintain-     style.css, app.js, map.js,
+  able. Mapbox token hardcoded.      panel.js. Token from env.
+
+mpa_zones conflated MPAs, FAO        Single zones table with a
+  areas, high seas, and EEZs.        zone_type enum column.
+  No way to distinguish them in
+  scoring queries.
+
+RFMO table empty but still gave      No-data = 0 points. Signal
+  +10 points to every vessel.        only activates when reference
+  Penalized vessels for missing      data exists.
+  reference data.
+
+Event pagination capped at 200       Paginate until exhausted.
+  per batch. Older events lost.      No artificial cap.
+
+No Pydantic response schemas.        Pydantic models for every
+  Dict-based responses with no       API response. Enforced by
+  validation or documentation.       FastAPI's response_model.
+
+reports.py duplicated scoring        One source of truth for
+  SQL before refactor. Easy to       signal computation. Reports
+  drift.                             call the scoring module.
+
+No tests.                            pytest + httpx AsyncClient
+                                     from day 1. At minimum:
+                                     scoring logic, API endpoints,
+                                     ingest parsers.
+
+WeasyPrint required manual           Dockerfile installs system
+  DYLD hacks on macOS.               deps. Dev uses HTML preview;
+                                     PDF is optional.
+
+docker-compose had no Redis.         Add Redis for task queue.
+
+Frontend fetched signals and         Single /vessels/{mmsi}/detail
+  events as separate requests.       endpoint returns everything
+  3 round-trips per vessel click.    the panel needs in one call.
+
+Vessel trails loaded ALL events      Trails endpoint accepts a
+  into memory and grouped in         time window. DB does the
+  Python.                            grouping with array_agg.
+
+No rate limiting on external         httpx client with semaphore
+  API calls. GFW could throttle      and retry-with-backoff.
+  or ban.
+
+Config scattered across os.getenv    pydantic-settings. One
+  calls with different defaults.     Settings class, one .env.
+
+
+================================================================
+1. PROJECT STRUCTURE
+================================================================
+
+darkfleet/
+  .env.example               environment variable template
+  .gitignore
+  alembic.ini                Alembic config
+  docker-compose.yml         postgres + redis + api
+  Dockerfile
+  pyproject.toml             project metadata, deps, tool config
+  README.md
+
+  alembic/
+    env.py                   async-aware migration runner
+    versions/                migration files
+
+  app/
+    __init__.py
+    config.py                pydantic-settings Settings class
+    database.py              engine, session factory, get_db
+    main.py                  FastAPI app, lifespan, router registration
+    models.py                all SQLAlchemy models
+    schemas.py               all Pydantic response/request schemas
+    scoring.py               batch scoring engine
+    tasks.py                 arq task definitions (ingest, rescore)
+    worker.py                arq worker entry point
+
+    routers/
+      __init__.py
+      vessels.py             vessel CRUD + detail + trails
+      alerts.py              alert list + fleet stats
+      scoring.py             rescore endpoints
+      reports.py             HTML + PDF incident reports
+      zones.py               zone GeoJSON
+      jobs.py                trigger + poll background jobs
+
+    connectors/
+      __init__.py
+      base.py                shared HTTP client, retry, rate limit
+      gfw.py                 Global Fishing Watch API
+      gisis.py               IMO GISIS web scraper
+      ccamlr.py              CCAMLR IUU list parser
+      wcpfc.py               WCPFC IUU list parser
+      rfmo.py                RFMO CSV parser
+      hsvar.py               FAO HSVAR parser
+      psc.py                 Paris MOU detention parser
+      zones.py               Marine Regions WFS + WDPA GeoJSON
+      sanctions.py           OpenSanctions loader
+
+  data/
+    ccamlr_iuu.csv           CCAMLR IUU vessel list
+    wcpfc_iuu.csv            WCPFC IUU vessel list
+    detentions.csv           compiled PSC detention records
+    opensanctions.json       OpenSanctions entity dump
+
+  web/
+    index.html
+    style.css
+    app.js                   state management, API calls, init
+    map.js                   Mapbox map, layers, animations
+    panel.js                 sidebar list + detail panel rendering
+    utils.js                 formatting helpers
+
+  tests/
+    conftest.py              async DB fixtures, test client
+    test_scoring.py          scoring logic unit tests
+    test_api.py              endpoint integration tests
+    test_connectors.py       parser unit tests (no network)
+
+
+================================================================
+2. DEPENDENCIES
+================================================================
+
+pyproject.toml [project.dependencies]:
+
+  fastapi>=0.115
+  uvicorn[standard]>=0.30
+  sqlalchemy[asyncio]>=2.0
+  asyncpg>=0.29
+  geoalchemy2>=0.15
+  alembic>=1.13
+  pydantic>=2.9
+  pydantic-settings>=2.5
+  httpx>=0.27
+  arq>=0.26
+  jinja2>=3.1
+  weasyprint>=62
+  beautifulsoup4>=4.12
+  python-dotenv>=1.0
+
+[project.optional-dependencies]:
+  dev = ["pytest>=8", "pytest-asyncio>=0.24", "httpx"]
+
+
+================================================================
+3. CONFIGURATION
+================================================================
+
+app/config.py:
+
+  from pydantic_settings import BaseSettings
+
+  class Settings(BaseSettings):
+      database_url: str = "postgresql+asyncpg://darkfleet:darkfleet@localhost:5432/darkfleet"
+      redis_url: str = "redis://localhost:6379"
+      gfw_api_key: str = ""
+      imo_gisis_username: str = ""
+      imo_gisis_password: str = ""
+      opensanctions_path: str = "data/opensanctions.json"
+      mapbox_token: str = ""
+      log_level: str = "INFO"
+
+      model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+
+  settings = Settings()
+
+Single source of truth. Every module imports settings from here.
+No os.getenv calls anywhere else in the codebase.
+
+
+================================================================
+4. DATABASE SCHEMA
+================================================================
+
+All tables defined in app/models.py. Managed by Alembic.
+PostGIS extension enabled in first migration.
+
+4.1  vessels
+-------------------------------------------------------------
+  Column               Type              Notes
+  mmsi                 VARCHAR(20)       PK
+  imo                  VARCHAR(20)       nullable, indexed
+  name                 VARCHAR(500)      nullable
+  flag_state           VARCHAR(10)       nullable, indexed
+  gear_type            VARCHAR(100)      nullable, indexed
+  gross_tonnage        INTEGER           nullable
+  last_seen            TIMESTAMPTZ       nullable
+  risk_score           FLOAT             default 0, not null
+  alert_tier           VARCHAR(10)       default 'clear', not null
+  flag_history         JSON              nullable, list of flag records
+  iuu_listed           BOOLEAN           default false
+  iuu_source           VARCHAR(100)      nullable
+  detained_recently    BOOLEAN           default false
+  ownership_verified   BOOLEAN           default false
+  created_at           TIMESTAMPTZ       server default now()
+  updated_at           TIMESTAMPTZ       server default now(), onupdate
+
+  Indexes: ix_vessels_tier (alert_tier),
+           ix_vessels_score (risk_score),
+           ix_vessels_flag_gear (flag_state, gear_type)
+
+4.2  events
+-------------------------------------------------------------
+  Column               Type              Notes
+  id                   VARCHAR(128)      PK (GFW event ID or UUID)
+  vessel_mmsi          VARCHAR(20)       indexed, FK-less (soft ref)
+  event_type           VARCHAR(50)       not null
+  started_at           TIMESTAMPTZ       nullable
+  ended_at             TIMESTAMPTZ       nullable
+  lat                  FLOAT             nullable
+  lon                  FLOAT             nullable
+  details              JSON              nullable (raw GFW payload)
+
+  Indexes: ix_events_vessel_type (vessel_mmsi, event_type),
+           ix_events_started (started_at)
+
+  event_type values: FISHING, GAP, LOITERING, ENCOUNTER,
+                     TRANSSHIPMENT
+
+  Note: v1 only stored "start" as timestamp. Events have
+  duration. Store both started_at and ended_at so gap duration
+  can be computed from the event row itself, not just from
+  the nested JSON.
+
+4.3  zones
+-------------------------------------------------------------
+  Column               Type              Notes
+  id                   SERIAL            PK
+  name                 VARCHAR(500)      not null
+  zone_type            VARCHAR(50)       not null, indexed
+  geometry             GEOMETRY(4326)    not null (PostGIS)
+
+  zone_type values: MPA, FAO_AREA, HIGH_SEAS, EEZ, RFMO_AREA
+
+  Spatial index: ix_zones_geom (GIST on geometry)
+
+  This replaces v1's mpa_zones. A single table with a type
+  column lets scoring queries target specific zone types:
+    WHERE zone_type = 'MPA'        -- for loitering signal
+    WHERE zone_type IN ('MPA', 'FAO_AREA')  -- for gap signal
+    WHERE zone_type = 'HIGH_SEAS'  -- for HSVAR signal
+
+4.4  iuu_blacklist
+-------------------------------------------------------------
+  Column               Type              Notes
+  id                   SERIAL            PK
+  imo                  VARCHAR(20)       nullable, indexed
+  mmsi                 VARCHAR(20)       nullable, indexed
+  vessel_name          VARCHAR(500)      nullable
+  name_normalized      VARCHAR(500)      nullable (uppercase, stripped)
+  flag_state           VARCHAR(10)       nullable
+  source               VARCHAR(50)       not null (CCAMLR, WCPFC, etc.)
+  listed_date          DATE              nullable
+  reason               TEXT              nullable
+
+  Unique: (source, coalesce(imo,''), coalesce(mmsi,''))
+
+4.5  rfmo_authorizations
+-------------------------------------------------------------
+  Column               Type              Notes
+  id                   SERIAL            PK
+  mmsi                 VARCHAR(20)       nullable, indexed
+  imo                  VARCHAR(20)       nullable, indexed
+  rfmo                 VARCHAR(50)       not null (WCPFC, ICCAT, etc.)
+  species              TEXT              nullable
+  zone                 TEXT              nullable
+
+4.6  fao_hsvar
+-------------------------------------------------------------
+  Column               Type              Notes
+  id                   SERIAL            PK
+  imo                  VARCHAR(20)       nullable, indexed
+  mmsi                 VARCHAR(20)       nullable, indexed
+  vessel_name          VARCHAR(500)      nullable
+  flag_state           VARCHAR(10)       not null
+  authorization        VARCHAR(200)      nullable
+  area                 VARCHAR(200)      nullable
+  valid_from           DATE              nullable
+  valid_to             DATE              nullable
+
+4.7  detention_records
+-------------------------------------------------------------
+  Column               Type              Notes
+  id                   SERIAL            PK
+  imo                  VARCHAR(20)       nullable, indexed
+  mmsi                 VARCHAR(20)       nullable, indexed
+  vessel_name          VARCHAR(500)      nullable
+  flag_state           VARCHAR(10)       nullable
+  port                 VARCHAR(200)      nullable
+  detained_date        DATE              not null
+  released_date        DATE              nullable
+  deficiencies         TEXT              nullable
+  source               VARCHAR(50)       not null (PARIS_MOU, TOKYO_MOU)
+
+  Unique: (source, coalesce(imo,''), detained_date)
+
+4.8  vessel_ownership
+-------------------------------------------------------------
+  Column               Type              Notes
+  id                   SERIAL            PK
+  mmsi                 VARCHAR(20)       nullable, indexed
+  imo                  VARCHAR(20)       nullable, indexed
+  registered_owner     TEXT              nullable
+  owner_country        TEXT              nullable
+  ship_manager         TEXT              nullable
+  technical_manager    TEXT              nullable
+  flag_state           VARCHAR(100)      nullable
+  vessel_status        VARCHAR(50)       nullable
+  source               VARCHAR(50)       not null (GISIS, EQUASIS, etc.)
+  fetched_at           TIMESTAMPTZ       not null
+
+4.9  jobs
+-------------------------------------------------------------
+  Column               Type              Notes
+  id                   UUID              PK, default gen_random_uuid()
+  job_type             VARCHAR(50)       not null (GFW_INGEST, RESCORE, etc.)
+  status               VARCHAR(20)       not null (PENDING, RUNNING, DONE, FAILED)
+  started_at           TIMESTAMPTZ       nullable
+  finished_at          TIMESTAMPTZ       nullable
+  result               JSON              nullable (counts, errors)
+  created_at           TIMESTAMPTZ       server default now()
+
+  Purpose: track background job progress so the frontend can
+  poll /jobs/{id} instead of holding a connection open.
+
+
+================================================================
+5. CONNECTORS — DATA SOURCE INTEGRATIONS
+================================================================
+
+All connectors live in app/connectors/. Each connector is a
+module with two responsibilities:
+  1. Fetch/parse raw data from the external source
+  2. Upsert results into the database
+
+Connectors do NOT compute scores. They only load data.
+
+5.1  Base connector (app/connectors/base.py)
+
+  Provides:
+  - get_http_client() -> httpx.AsyncClient with:
+      timeout=30s, follow_redirects=True
+  - rate_limited_get(client, url, params, max_concurrent=5,
+      delay=0.5) using asyncio.Semaphore
+  - retry_with_backoff(func, max_retries=3, base_delay=1.0)
+
+  Every connector that makes HTTP calls uses these helpers.
+  No raw httpx.get() calls anywhere else.
+
+5.2  GFW connector (app/connectors/gfw.py)
+
+  External API: https://gateway.api.globalfishingwatch.org/v3
+  Auth: Bearer token (settings.gfw_api_key)
+
+  Functions:
+
+    async def fetch_vessels(query: str = "",
+                            limit: int = 0) -> list[dict]
+      If query is set: paginate /v3/vessels/search with query
+        parameter (500/page) until exhausted or limit reached.
+      If no query: iterate over VESSEL_TYPES list, for each type
+        paginate /v3/vessels/search with where filter (50/page)
+        until exhausted. Deduplicate by GFW vessel ID across all
+        types. Apply global limit after dedup if set.
+
+      VESSEL_TYPES:
+        DRIFTING_LONGLINES, TRAWLERS, PURSE_SEINES, SQUID_JIGS,
+        POLE_AND_LINE, TROLLERS, POTS_AND_TRAPS, SET_LONGLINES,
+        FIXED_GEAR, SET_GILLNETS, DRIFT_GILLNETS, LIFT_NETS,
+        CARRIER, BUNKER
+
+    async def fetch_events(gfw_vessel_ids: list[str],
+                           start_date: str,
+                           end_date: str) -> list[dict]
+      Batch vessel IDs into groups of 10 (API limit).
+      For each batch, paginate /v3/events with offset until
+        len(entries) < limit (i.e., exhausted).
+      Datasets: fishing, gaps, loitering (all three in every
+        request via datasets[0], datasets[1], datasets[2]).
+      No artificial cap on total events.
+
+    def parse_vessel(raw: dict) -> dict | None
+      Extract from GFW v4 schema:
+        registryInfo[0] -> mmsi, imo, name, flag, gear, last_seen
+        selfReportedInfo -> flag_history
+        combinedSourcesInfo -> fallback fields
+      Return None if no MMSI found.
+
+    def parse_event(raw: dict) -> dict
+      Extract: id, vessel_mmsi, event_type (uppercased),
+        started_at (from "start"), ended_at (from "end"),
+        lat, lon (from "position"), details (full raw dict).
+
+    async def ingest(db: AsyncSession, query: str = "",
+                     vessel_limit: int = 0) -> dict
+      Orchestrator:
+        1. Fetch vessels
+        2. Parse and deduplicate by MMSI
+        3. Upsert into vessels table (ON CONFLICT update identity
+           fields only — never overwrite risk_score/alert_tier)
+        4. Extract GFW vessel IDs from combinedSourcesInfo
+        5. Compute date window from vessel transmission dates
+        6. Fetch events
+        7. Parse events
+        8. Upsert into events table (ON CONFLICT DO NOTHING)
+        9. Return {"vessels_upserted": N, "events_upserted": N}
+
+5.3  IUU Blacklist connector (app/connectors/ccamlr.py, wcpfc.py)
+
+  Input: CSV files at data/ccamlr_iuu.csv, data/wcpfc_iuu.csv
+  These are small, manually maintained files (10-30 rows each).
+  Transcribed from the CCAMLR and WCPFC annual publications.
+
+  CSV format:
+    IMO,MMSI,vessel_name,flag_state,listed_date,reason
+
+  Functions:
+
+    def parse_csv(path: str, source: str) -> list[dict]
+      Read CSV. For each row, compute name_normalized:
+        uppercase, strip punctuation, collapse whitespace.
+      Return list of dicts matching iuu_blacklist schema.
+
+    async def ingest(db: AsyncSession, path: str,
+                     source: str) -> dict
+      Parse CSV. Upsert into iuu_blacklist.
+      Cross-reference against vessels table:
+        UPDATE vessels SET iuu_listed = true, iuu_source = :source
+        WHERE imo IN (SELECT imo FROM iuu_blacklist WHERE source = :source AND imo IS NOT NULL)
+           OR mmsi IN (SELECT mmsi FROM iuu_blacklist WHERE source = :source AND mmsi IS NOT NULL)
+      Return {"rows_loaded": N, "vessels_matched": N}
+
+5.4  RFMO connector (app/connectors/rfmo.py)
+
+  Input: CSV downloads from WCPFC, ICCAT, IOTC, etc.
+  Uses flexible column mapping (candidate column names tried
+  in order) to handle varying CSV formats across RFMOs.
+
+  async def ingest(db, path: str, rfmo: str) -> dict
+    Parse CSV with DictReader. Map columns flexibly.
+    Upsert into rfmo_authorizations.
+    Return {"rows_loaded": N}
+
+5.5  FAO HSVAR connector (app/connectors/hsvar.py)
+
+  Input: CSV from FAO HSVAR download.
+  Same flexible column mapping approach as RFMO connector.
+
+  async def ingest(db, path: str) -> dict
+    Parse CSV. Upsert into fao_hsvar.
+    Return {"rows_loaded": N}
+
+5.6  PSC Detention connector (app/connectors/psc.py)
+
+  Input: data/detentions.csv (manually compiled)
+  CSV format:
+    IMO,MMSI,vessel_name,flag_state,port,detained_date,
+    released_date,deficiencies,source
+
+  async def ingest(db, path: str) -> dict
+    Parse CSV. Upsert into detention_records.
+    Cross-reference: set vessels.detained_recently = true where
+      detention_records.detained_date >= NOW() - INTERVAL '24 months'
+      matched by IMO or MMSI.
+    Return {"rows_loaded": N, "vessels_matched": N}
+
+5.7  GISIS connector (app/connectors/gisis.py)
+
+  External: gisis.imo.org (ASP.NET WebForms, login required)
+  Auth: IMO web account (settings.imo_gisis_username/password)
+
+  Class GISISClient:
+    __init__(username, password)
+    async login() -> bool
+      GET login page, extract __VIEWSTATE and __EVENTVALIDATION,
+      POST credentials. Verify success by checking response.
+    async fetch_vessel(imo: str) -> dict | None
+      GET /Public/SHIPS/Default.aspx?imo={imo}
+      Parse HTML with BeautifulSoup. Extract:
+        registered_owner, owner_country, ship_manager,
+        technical_manager, flag_state, vessel_status.
+      Return dict or None on failure.
+
+  async def enrich(db: AsyncSession, limit: int = 50,
+                   mmsi: str | None = None) -> dict
+    Query vessels where ownership_verified = false and imo is
+    not null, limited to `limit` rows.
+    For each vessel:
+      Fetch from GISIS. If successful:
+        Insert into vessel_ownership.
+        Set vessel.ownership_verified = true.
+      Rate limit: 2 seconds between requests.
+    Return {"enriched": N, "failed": N}
+
+  NOTE: GISIS HTML selectors MUST be verified against the live
+  page before this connector is considered working. The selectors
+  are heuristic and will break if IMO changes their page layout.
+  Test manually with 3-5 known IMO numbers first.
+
+5.8  Zone connector (app/connectors/zones.py)
+
+  Two data sources, one table.
+
+  Marine Regions WFS (no auth):
+    FAO areas: MarineRegions:fao (zone_type = FAO_AREA)
+    High seas: MarineRegions:high_seas (zone_type = HIGH_SEAS)
+    EEZ: MarineRegions:eez (zone_type = EEZ)
+
+  WDPA GeoJSON file (manual download from protectedplanet.net):
+    Marine protected areas (zone_type = MPA)
+
+  async def ingest_wfs(db, layers: list[str]) -> dict
+    For each layer, GET from geo.vliz.be WFS.
+    Explode MultiPolygon to individual Polygons.
+    INSERT into zones with appropriate zone_type.
+
+  async def ingest_wdpa(db, geojson_path: str) -> dict
+    Read GeoJSON file. Extract polygon features.
+    INSERT into zones with zone_type = MPA.
+
+5.9  Sanctions connector (app/connectors/sanctions.py)
+
+  Input: data/opensanctions.json
+  Loaded into memory at app startup (not into a DB table).
+
+  def load() -> tuple[set[str], set[str]]
+    Returns (sanctioned_flags, sanctioned_names).
+    Flags are ISO-2 uppercased. Names are lowercased.
+
+  Called once during app lifespan. The sets are passed to the
+  scoring engine. No database table needed — the dataset is
+  small and read-only.
+
+
+================================================================
+6. SCORING ENGINE
+================================================================
+
+File: app/scoring.py
+
+The scoring engine computes a 0-100 risk score for each vessel
+from 9 weighted signals. All temporal signals use a 12-month
+rolling window. Two hard triggers override the numeric score.
+
+6.1  Signal definitions
+
+  BEHAVIORAL SIGNALS (from events table + PostGIS)
+  -------------------------------------------------
+
+  Signal 1: Transshipment / encounters
+    Weight: 25 pts each, cap at 50
+    Query:  COUNT events WHERE vessel_mmsi = :mmsi
+              AND event_type IN ('ENCOUNTER', 'TRANSSHIPMENT')
+              AND started_at >= NOW() - INTERVAL '12 months'
+    Rationale: Transshipment at sea is the primary mechanism for
+      laundering illegal catch. Weighted as strongest behavioral
+      signal.
+
+  Signal 2: AIS dark gaps near protected/regulated zones
+    Weight: 15 pts first gap, 10 pts each additional, cap at 35
+    Query:  COUNT events WHERE vessel_mmsi = :mmsi
+              AND event_type = 'GAP'
+              AND COALESCE((details->'gap'->>'durationHours')::float, 0) > 6
+              AND started_at >= NOW() - INTERVAL '12 months'
+              AND EXISTS (
+                SELECT 1 FROM zones z
+                WHERE z.zone_type IN ('MPA', 'FAO_AREA')
+                AND ST_DWithin(
+                  z.geometry::geography,
+                  ST_SetSRID(ST_MakePoint(e.lon, e.lat), 4326)::geography,
+                  50000
+                )
+              )
+    Note: uses ST_DWithin with 50km buffer on geography type.
+      Only gaps near MPAs or FAO regulatory areas count. A gap
+      in the middle of open ocean scores nothing.
+
+  Signal 3: Loitering inside protected zones
+    Weight: 10 pts each, cap at 20
+    Query:  COUNT events WHERE vessel_mmsi = :mmsi
+              AND event_type = 'LOITERING'
+              AND COALESCE((details->'loitering'->>'totalTimeHours')::float, 0) > 2
+              AND started_at >= NOW() - INTERVAL '12 months'
+              AND EXISTS (
+                SELECT 1 FROM zones z
+                WHERE z.zone_type = 'MPA'
+                AND ST_Within(
+                  ST_SetSRID(ST_MakePoint(e.lon, e.lat), 4326),
+                  z.geometry
+                )
+              )
+    Note: uses ST_Within (point inside polygon), not ST_DWithin.
+      Loitering must be inside an MPA, not just near one.
+
+  Signal 4: Peer-comparison gap anomaly
+    Weight: 15 pts if > avg + 1 stddev, 8 pts if > avg, else 0
+    Requires: >= 5 peer vessels with same gear_type and flag_state
+    Query (per-vessel):
+      WITH vessel_gaps AS (
+        SELECT COUNT(*) AS n FROM events
+        WHERE vessel_mmsi = :mmsi AND event_type = 'GAP'
+          AND COALESCE((details->'gap'->>'durationHours')::float, 0) > 6
+          AND started_at >= NOW() - INTERVAL '12 months'
+      ), peer_stats AS (
+        SELECT AVG(cnt)::float AS avg_gaps,
+               STDDEV_POP(cnt)::float AS std_gaps,
+               COUNT(*)::int AS peer_count
+        FROM (
+          SELECT COUNT(e.id) AS cnt
+          FROM vessels v
+          LEFT JOIN events e
+            ON e.vessel_mmsi = v.mmsi
+            AND e.event_type = 'GAP'
+            AND COALESCE((e.details->'gap'->>'durationHours')::float, 0) > 6
+            AND e.started_at >= NOW() - INTERVAL '12 months'
+          WHERE v.gear_type = :gear_type
+            AND v.flag_state = :flag_state
+          GROUP BY v.mmsi
+        ) t
+      )
+      SELECT vg.n, ps.avg_gaps, ps.std_gaps, ps.peer_count
+      FROM vessel_gaps vg, peer_stats ps
+
+    Logic:
+      if peer_count < 5: return 0 (insufficient data)
+      if n > avg_gaps + std_gaps: return 15
+      if n > avg_gaps: return 8
+      else: return 0
+
+    For batch scoring: precompute peer_stats into a dict keyed
+    by (gear_type, flag_state) with one query, then look up.
+
+  REGISTRY SIGNALS (from reference tables)
+  -----------------------------------------
+
+  Signal 5: RFMO authorization absent
+    Weight: 25 pts if absent, 0 if authorized, 0 if no data
+    Query:  Check if rfmo_authorizations table has any rows.
+            If empty: return 0 (no data, no penalty).
+            If has data: check if vessel is in it by MMSI or IMO.
+              If found: 0.  If not found: 25.
+
+  Signal 6: FAO HSVAR absence (high seas only)
+    Weight: 10 pts if absent from HSVAR while operating on high seas
+    Query:  First check if vessel has recent activity on high seas:
+              SELECT EXISTS (
+                SELECT 1 FROM events e
+                JOIN zones z ON z.zone_type = 'HIGH_SEAS'
+                  AND ST_Within(ST_SetSRID(ST_MakePoint(e.lon, e.lat), 4326), z.geometry)
+                WHERE e.vessel_mmsi = :mmsi
+                  AND e.started_at >= NOW() - INTERVAL '12 months'
+              )
+            If not on high seas: return 0 (signal does not apply).
+            If on high seas: check fao_hsvar table.
+              If fao_hsvar is empty: return 0 (no data).
+              If vessel not in fao_hsvar: return 10.
+              If vessel in fao_hsvar: return 0.
+
+  IDENTITY SIGNALS (from vessel data)
+  ------------------------------------
+
+  Signal 7: Flag state changes
+    Weight: 10 pts if 2+ distinct flags in 12 months, else 0
+    Input:  vessel.flag_history JSON array.
+    Logic:  Filter entries where last_transmission is within 12
+            months. Count distinct flag codes. If >= 2: 10 pts.
+    Note: a single flag is normal (0 pts). The v1 design gave
+      5 pts for 1 flag, which penalized normal vessels.
+
+  Signal 8: Ownership opacity
+    Weight: 5 pts if Flag of Convenience AND not verified
+    FOC flags: PA, LR, MH, BS, MT, CY, VG, KY, AG, VC, VU,
+               CK, KM, MD, TG
+    Logic:  if flag_state in FOC_FLAGS and not ownership_verified:
+              return 5
+            else: return 0
+    Note: FOC alone is not suspicious (most global shipping uses
+      FOC registries). It only scores if ALSO unverified.
+
+  Signal 9: Sanctions list match
+    Weight: 5 pts
+    Input:  in-memory sanctioned_flags and sanctioned_names sets.
+    Logic:  if flag_state in sanctioned_flags: return 5
+            if name.lower() in sanctioned_names: return 5
+            else: return 0
+
+  HARD TRIGGERS (override numeric score)
+  ----------------------------------------
+
+  Hard trigger A: IUU blacklist match
+    Check: iuu_blacklist table by IMO, MMSI, or name_normalized
+      (trigram similarity > 0.7 for name matching — requires
+       pg_trgm extension).
+    Effect: score = 100, tier = "red", overridden = true
+    This is absolute. A vessel on CCAMLR or WCPFC IUU lists is
+    confirmed illegal. No amount of good signals can offset it.
+
+  Hard trigger B: Recent detention
+    Check: detention_records by IMO or MMSI where
+      detained_date >= NOW() - INTERVAL '24 months'
+    Effect: score = max(score, 60), tier = at least "amber"
+    A detained vessel has documented deficiencies. It cannot be
+    "clear" regardless of behavioral signals.
+
+6.2  Tier thresholds
+
+  red   >= 80  (or any hard-trigger-A match)
+  amber >= 60  (or any hard-trigger-B match)
+  clear <  60
+
+6.3  Batch scoring implementation
+
+  async def rescore_all(db: AsyncSession) -> dict
+
+  The batch rescoring path avoids N+1 queries:
+
+  Step 1: Precompute behavioral signal counts for ALL vessels
+    in a single query per signal type.
+
+    WITH gap_counts AS (
+      SELECT e.vessel_mmsi AS mmsi, COUNT(*) AS n
+      FROM events e
+      WHERE e.event_type = 'GAP'
+        AND COALESCE((e.details->'gap'->>'durationHours')::float, 0) > 6
+        AND e.started_at >= NOW() - INTERVAL '12 months'
+        AND EXISTS (SELECT 1 FROM zones z
+                    WHERE z.zone_type IN ('MPA', 'FAO_AREA')
+                    AND ST_DWithin(z.geometry::geography,
+                        ST_SetSRID(ST_MakePoint(e.lon, e.lat), 4326)::geography,
+                        50000))
+      GROUP BY e.vessel_mmsi
+    )
+
+    Similar CTEs for encounter_counts, loiter_counts.
+    Result: dict[mmsi, SignalCounts] built in Python.
+
+  Step 2: Precompute peer stats for all (gear_type, flag_state)
+    combinations in one query.
+
+  Step 3: Load all reference lookups into memory:
+    - Set of (imo, mmsi) pairs in iuu_blacklist
+    - Set of (imo, mmsi) pairs in rfmo_authorizations
+    - Set of (imo, mmsi) pairs in fao_hsvar
+    - Set of (imo, mmsi) pairs in detention_records (recent)
+    - Whether rfmo_authorizations has any data at all
+    - Whether fao_hsvar has any data at all
+
+  Step 4: Load all vessels. For each vessel, compute score
+    using precomputed data (pure Python, no SQL per vessel).
+
+  Step 5: Batch UPDATE vessels SET risk_score, alert_tier
+    using executemany or CASE expression.
+
+  This reduces ~3500 queries (v1 for 500 vessels) to ~10 queries
+  regardless of fleet size.
+
+6.4  Single-vessel scoring
+
+  async def score_vessel(mmsi: str, db: AsyncSession) -> ScoringResult
+
+  For single-vessel scoring (e.g., after enrichment), the
+  individual SQL queries are acceptable since it is one vessel.
+  Reuse the same signal logic but with per-vessel queries.
+
+6.5  Data structures
+
+  @dataclass
+  class SignalResult:
+      name: str           # "Transshipment / encounters"
+      triggered: bool
+      points: float
+      detail: str         # "2 events in 12 months"
+      category: str       # "behavioral", "registry", "identity"
+
+  @dataclass
+  class HardTrigger:
+      name: str           # "IUU_BLACKLIST"
+      source: str         # "CCAMLR"
+      detail: str         # "Listed 2024-11-01: fishing without authorization"
+
+  @dataclass
+  class ScoringResult:
+      score: float
+      tier: str
+      signals: list[SignalResult]
+      hard_triggers: list[HardTrigger]
+      overridden: bool
+
+
+================================================================
+7. BACKGROUND JOBS
+================================================================
+
+File: app/tasks.py (task definitions)
+File: app/worker.py (arq worker entry point)
+
+Using arq (async Redis queue). Lightweight, async-native,
+no Celery overhead.
+
+7.1  Task definitions
+
+  async def task_gfw_ingest(ctx, query: str = "",
+                            vessel_limit: int = 0) -> dict
+    Get db session from ctx.
+    Call gfw.ingest(db, query, vessel_limit).
+    Call rescore_all(db).
+    Update jobs table: status = DONE, result = counts.
+
+  async def task_rescore(ctx) -> dict
+    Call rescore_all(db).
+    Update jobs table.
+
+  async def task_enrich_gisis(ctx, limit: int = 50) -> dict
+    Call gisis.enrich(db, limit).
+    Rescore affected vessels.
+    Update jobs table.
+
+  async def task_ingest_blacklists(ctx) -> dict
+    Call ccamlr.ingest(db, "data/ccamlr_iuu.csv", "CCAMLR").
+    Call wcpfc.ingest(db, "data/wcpfc_iuu.csv", "WCPFC").
+    Rescore affected vessels.
+    Update jobs table.
+
+  async def task_ingest_detentions(ctx) -> dict
+    Call psc.ingest(db, "data/detentions.csv").
+    Rescore affected vessels.
+    Update jobs table.
+
+7.2  Worker entry point (app/worker.py)
+
+  from arq import create_pool
+  from arq.connections import RedisSettings
+
+  class WorkerSettings:
+      functions = [task_gfw_ingest, task_rescore,
+                   task_enrich_gisis, task_ingest_blacklists,
+                   task_ingest_detentions]
+      redis_settings = RedisSettings.from_dsn(settings.redis_url)
+
+  Run with: arq app.worker.WorkerSettings
+
+7.3  Job tracking
+
+  When a task starts, it creates a row in the jobs table with
+  status = RUNNING. On completion, updates to DONE or FAILED.
+  The /jobs/{id} endpoint returns the current status.
+
+  The frontend polls /jobs/{id} every 2 seconds until status
+  is DONE or FAILED, then refreshes the vessel list.
+
+
+================================================================
+8. API DESIGN
+================================================================
+
+All endpoints return JSON. Response schemas defined in
+app/schemas.py with Pydantic models.
+
+8.1  Vessel endpoints (app/routers/vessels.py)
+
+  GET /vessels
+    Query params: limit (default 200), offset, tier (optional filter)
+    Response: list[VesselSummary]
+    VesselSummary: mmsi, imo, name, flag_state, gear_type,
+      last_seen, risk_score, alert_tier, iuu_listed, detained_recently
+
+  GET /vessels/{mmsi}
+    Response: VesselDetail
+    Returns everything the detail panel needs in ONE request:
+      vessel identity, risk score + tier, signal breakdown,
+      hard triggers, recent events (5), ownership (if exists),
+      blacklist entries (if any), detention records (if any).
+    This replaces v1's pattern of 3 separate fetches.
+
+  GET /vessels/trails
+    Query params: hours (default 8760 = 12 months), limit_per_vessel (default 20)
+    Response: GeoJSON FeatureCollection of LineStrings
+    Query:
+      SELECT vessel_mmsi,
+             array_agg(ARRAY[lon, lat] ORDER BY started_at) AS coords,
+             v.alert_tier
+      FROM events e
+      JOIN vessels v ON v.mmsi = e.vessel_mmsi
+      WHERE e.lat IS NOT NULL AND e.lon IS NOT NULL
+        AND e.started_at >= NOW() - INTERVAL ':hours hours'
+      GROUP BY e.vessel_mmsi, v.alert_tier
+    Build LineStrings in Python. Return as FeatureCollection.
+    The DB does the grouping (not Python as in v1).
+
+8.2  Alert endpoints (app/routers/alerts.py)
+
+  GET /alerts
+    Response: list[AlertEntry]
+    AlertEntry: vessel summary + most_recent_event (LATERAL join)
+    Ordered by risk_score DESC.
+    Includes iuu_listed and detained_recently flags.
+
+  GET /stats
+    Response: FleetStats
+    FleetStats: total_vessels, by_tier (red/amber/clear counts),
+      iuu_listed_count, detained_count, avg_risk_score,
+      last_ingest (most recent jobs row of type GFW_INGEST)
+
+8.3  Scoring endpoints (app/routers/scoring.py)
+
+  POST /score/all
+    Enqueues task_rescore via arq.
+    Response: {"job_id": "uuid"}
+
+  POST /score/{mmsi}
+    Scores single vessel synchronously (fast enough).
+    Response: ScoringResult
+
+8.4  Report endpoints (app/routers/reports.py)
+
+  GET /reports/{mmsi}/html
+    Renders full incident report as HTML.
+    Sections:
+      1. Vessel profile
+      2. IUU blacklist status
+      3. RFMO authorization status
+      4. Port state control history
+      5. FAO HSVAR authorization (if applicable)
+      6. Ownership & registry (if verified)
+      7. Event timeline (12 months)
+      8. Score breakdown (all signals + hard triggers)
+    Uses Jinja2 template stored as a separate file:
+      app/templates/report.html
+
+  GET /reports/{mmsi}/pdf
+    Same content, rendered to PDF via WeasyPrint.
+    Returns as attachment with Content-Disposition header.
+
+8.5  Zone endpoints (app/routers/zones.py)
+
+  GET /zones
+    Query params: zone_type (optional, e.g. "MPA")
+    Response: GeoJSON FeatureCollection
+    If zone_type is set, filters by it. Otherwise returns all.
+
+8.6  Job endpoints (app/routers/jobs.py)
+
+  POST /jobs/ingest
+    Body: {"query": "", "vessel_limit": 0}
+    Enqueues task_gfw_ingest.
+    Creates jobs row with status PENDING.
+    Response: {"job_id": "uuid"}
+
+  POST /jobs/enrich
+    Body: {"limit": 50}
+    Enqueues task_enrich_gisis.
+    Response: {"job_id": "uuid"}
+
+  POST /jobs/blacklists
+    Enqueues task_ingest_blacklists.
+    Response: {"job_id": "uuid"}
+
+  POST /jobs/detentions
+    Enqueues task_ingest_detentions.
+    Response: {"job_id": "uuid"}
+
+  GET /jobs/{job_id}
+    Response: JobStatus
+    JobStatus: id, job_type, status, started_at, finished_at, result
+
+
+================================================================
+9. FRONTEND
+================================================================
+
+Directory: web/
+Served as static files by FastAPI:
+  app.mount("/", StaticFiles(directory="web", html=True))
+
+No build step. No bundler. Plain JS modules with <script type="module">.
+Mapbox GL loaded from CDN.
+
+9.1  File structure
+
+  web/index.html    Page shell, panel layout, CSS link, JS imports
+  web/style.css     All styles (dark theme, panels, cards, badges)
+  web/app.js        State, API calls, initialization, job polling
+  web/map.js        Mapbox init, layers, pulsing dots, trail rendering
+  web/panel.js      Sidebar list, detail panel, signal rendering
+
+9.2  index.html
+
+  Minimal HTML. Three containers:
+    <div id="map">           Mapbox fills this
+    <aside id="sidebar">     Left panel (vessel list)
+    <aside id="detail">      Right panel (vessel detail)
+
+  Sidebar contains:
+    - Title row with "DarkFleet" and reload button
+    - Fleet stats bar (total / red / amber / blacklisted)
+    - Tier filter tabs (All / Red / Amber / Clear)
+    - Scrollable vessel card list
+
+  Detail panel is empty until a vessel is selected.
+
+  <script type="module" src="app.js"></script>
+
+9.3  app.js — state and data
+
+  const state = {
+    vessels: [],        // from GET /alerts
+    trails: null,       // from GET /vessels/trails
+    stats: null,        // from GET /stats
+    filteredTier: "all",
+    selectedMmsi: null,
+    activeJobId: null,
+  };
+
+  export async function loadAlerts()
+    Fetch GET /alerts. Store in state.vessels.
+    Call renderVesselList() and updateMarkerLayer().
+
+  export async function loadTrails()
+    Fetch GET /vessels/trails.
+    Store in state.trails. Call updateTrailLayer().
+
+  export async function loadStats()
+    Fetch GET /stats. Store in state.stats.
+    Call renderStatsBar().
+
+  export async function loadDetail(mmsi)
+    Fetch GET /vessels/{mmsi}. (Single request, all data.)
+    Call renderDetail(data).
+
+  export async function triggerIngest()
+    POST /jobs/ingest. Get job_id. Set state.activeJobId.
+    Start polling pollJob(job_id).
+
+  async function pollJob(jobId)
+    Every 2 seconds, GET /jobs/{jobId}.
+    Update reload button text with status.
+    On DONE: reload alerts + trails + stats. Clear activeJobId.
+    On FAILED: show error in subtitle.
+
+  Initialization (on DOMContentLoaded):
+    initMap() -> on map load:
+      loadZones()
+      loadAlerts()
+      loadTrails()
+      loadStats()
+      wireTabs()
+
+9.4  map.js — Mapbox layers
+
+  export function initMap()
+    Create Mapbox map with dark-v11 style, centered [0,0] zoom 2.
+    Return map instance.
+
+  export function updateMarkerLayer(vessels, filteredTier)
+    Build GeoJSON FeatureCollection from vessels (filter by tier).
+    Three layers (same as v1 — this worked well):
+      vessels-pulse-red:   animated pulsing ring for red tier
+      vessels-pulse-amber: animated pulsing ring for amber tier
+      vessels-circles:     circle layer for all vessels
+    Circle radius: interpolate risk_score 0->3px, 100->8px.
+    Circle color: match alert_tier -> red/amber/gray.
+
+  export function updateTrailLayer(trails, filteredTier)
+    Filter trails by tier. Split into per-segment features.
+    Drop segments > 500km (teleport filter, haversine approx).
+    Per-segment opacity: (index / total) * 0.65 (fade effect).
+    Line layer below circle layer.
+
+  export function updateZoneLayer(geojson)
+    Blue fill (15% opacity) + blue outline for zone polygons.
+
+  export function flyTo(lon, lat)
+    map.flyTo with zoom max(current, 6), speed 1.4.
+
+  Pulsing dot implementation: same canvas-based approach as v1.
+    240px canvas, two rings offset by 0.5 phase, rendered every
+    frame via map.triggerRepaint(). This was effective — keep it.
+
+9.5  panel.js — UI rendering
+
+  export function renderVesselList(vessels, filteredTier)
+    Filter vessels by tier. For each:
+      Card with name, MMSI, flag emoji, risk score, tier badge.
+      If iuu_listed: red "IUU LISTED" badge.
+      If detained_recently: orange "DETAINED" badge.
+    Click handler -> selectVessel(mmsi).
+
+  export function renderDetail(data)
+    Full detail panel:
+      - Vessel identity (name, MMSI, IMO, flag, gear)
+      - Conic-gradient score ring
+      - Hard triggers (if any) — red banner at top
+      - Signal breakdown rows
+      - Ownership section (if verified)
+      - IUU blacklist status
+      - Detention history (if any)
+      - Recent events list
+      - Report download/preview links
+
+  export function renderStatsBar(stats)
+    Thin bar above vessel list:
+      "523 vessels | 3 Red | 12 Amber | 2 IUU Listed"
+
+  Hard trigger rendering:
+    Red background, full-width, bold text.
+    "IUU BLACKLISTED — CCAMLR (listed 2024-11-01)"
+    Appears above all other signals.
+
+  Signal row rendering:
+    Left: signal name + detail in muted text
+    Right: point value (red if triggered, gray if not)
+    Triggered rows get a subtle red-tinted background.
+
+9.6  style.css
+
+  Same design language as v1 (it looked good):
+    --bg: #0d1117, --card: #161b22, --border: #30363d
+    --red: #ff4d4f, --amber: #ff9f1a, --clear: #6e7681
+  Add:
+    .badge.iuu     — red background, white text, "IUU LISTED"
+    .badge.detained — amber background, white text, "DETAINED"
+    .hard-trigger   — full-width red banner
+    .stats-bar      — compact bar above vessel list
+  Scrollbar: dark-themed (already solved in v1, carry over).
+
+9.7  Mapbox token
+
+  Served from the backend. The HTML template includes:
+    <meta name="mapbox-token" content="{{ mapbox_token }}">
+  FastAPI renders index.html via Jinja2 with the token from
+  settings.mapbox_token. Never hardcoded in the HTML file.
+
+  Alternatively: fetch token from a /config endpoint on page load.
+
+
+================================================================
+10. DOCKER DEPLOYMENT
+================================================================
+
+docker-compose.yml:
+
+  services:
+    db:
+      image: postgis/postgis:16-3.4
+      environment:
+        POSTGRES_DB: darkfleet
+        POSTGRES_USER: darkfleet
+        POSTGRES_PASSWORD: darkfleet
+      ports: ["5432:5432"]
+      volumes: [postgres_data:/var/lib/postgresql/data]
+      healthcheck:
+        test: pg_isready -U darkfleet
+        interval: 5s
+
+    redis:
+      image: redis:7-alpine
+      ports: ["6379:6379"]
+      healthcheck:
+        test: redis-cli ping
+        interval: 5s
+
+    api:
+      build: .
+      ports: ["8000:8000"]
+      depends_on:
+        db: {condition: service_healthy}
+        redis: {condition: service_healthy}
+      env_file: [.env]
+      environment:
+        DATABASE_URL: postgresql+asyncpg://darkfleet:darkfleet@db:5432/darkfleet
+        REDIS_URL: redis://redis:6379
+      command: >
+        sh -c "alembic upgrade head &&
+               uvicorn app.main:app --host 0.0.0.0 --port 8000"
+
+    worker:
+      build: .
+      depends_on:
+        db: {condition: service_healthy}
+        redis: {condition: service_healthy}
+      env_file: [.env]
+      environment:
+        DATABASE_URL: postgresql+asyncpg://darkfleet:darkfleet@db:5432/darkfleet
+        REDIS_URL: redis://redis:6379
+      command: arq app.worker.WorkerSettings
+
+  volumes:
+    postgres_data:
+
+Dockerfile:
+
+  FROM python:3.12-slim
+  WORKDIR /app
+  RUN apt-get update && apt-get install -y \
+      libpq-dev gcc libpango-1.0-0 libpangocairo-1.0-0 \
+      libgdk-pixbuf2.0-0 libffi-dev shared-mime-info \
+      && rm -rf /var/lib/apt/lists/*
+  COPY pyproject.toml .
+  RUN pip install --no-cache-dir .
+  COPY . .
+  CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+  Note: WeasyPrint system dependencies (pango, gdk-pixbuf) are
+  installed in the Docker image. No DYLD hacks needed.
+
+
+================================================================
+11. TESTING
+================================================================
+
+Minimum viable test suite. Run with: pytest
+
+11.1 tests/conftest.py
+  - Async engine pointing at a test database (or use
+    postgresql testcontainer)
+  - Fixture: db session with transaction rollback
+  - Fixture: FastAPI TestClient with dependency override
+
+11.2 tests/test_scoring.py
+  - Test each signal function with known inputs
+  - Test hard triggers override score
+  - Test batch scoring matches single-vessel scoring
+  - Test peer comparison with <5 peers returns 0
+  - Test empty reference tables return 0, not penalty
+
+11.3 tests/test_api.py
+  - GET /vessels returns list
+  - GET /vessels/{mmsi} returns detail or 404
+  - GET /alerts returns sorted list
+  - POST /score/{mmsi} returns score
+  - GET /zones returns GeoJSON
+
+11.4 tests/test_connectors.py
+  - Test parse_vessel with real GFW API response fixture
+  - Test parse_event with real GFW event fixture
+  - Test IUU CSV parser with sample rows
+  - Test RFMO CSV parser with varying column names
+  - No network calls — use fixture data
+
+
+================================================================
+12. IMPLEMENTATION ORDER
+================================================================
+
+Build in this exact order. Each phase is independently runnable
+and testable. Do not skip ahead.
+
+PHASE 0 — Skeleton (30 min)
+  - Create project directory structure
+  - pyproject.toml with all dependencies
+  - docker-compose.yml (postgres + redis)
+  - app/config.py (Settings class)
+  - app/database.py (engine, session, get_db)
+  - app/models.py (all tables)
+  - app/main.py (FastAPI app, lifespan, static mount)
+  - alembic init, first migration creating all tables
+  - docker compose up, verify tables exist
+  - Commit: "scaffold: project structure, models, migrations"
+
+PHASE 1 — GFW Ingest + Basic API (2 hours)
+  - app/connectors/base.py (HTTP client helpers)
+  - app/connectors/gfw.py (vessel + event fetch, parse, upsert)
+  - app/tasks.py (task_gfw_ingest)
+  - app/worker.py (arq worker settings)
+  - app/routers/jobs.py (POST /jobs/ingest, GET /jobs/{id})
+  - app/routers/vessels.py (GET /vessels, /vessels/{mmsi},
+    /vessels/trails)
+  - app/routers/alerts.py (GET /alerts)
+  - Run GFW ingest manually (or via endpoint)
+  - Verify vessels and events in DB
+  - Commit: "feat: GFW ingest, vessel API, job queue"
+
+PHASE 2 — Scoring Engine (2 hours)
+  - app/scoring.py (all 9 signals + 2 hard triggers)
+  - app/routers/scoring.py (POST /score/all, /score/{mmsi})
+  - tests/test_scoring.py
+  - Rescore all vessels, verify tier distribution
+  - Commit: "feat: scoring engine with 9 signals + hard triggers"
+
+PHASE 3 — Reference Data (1.5 hours)
+  - app/connectors/ccamlr.py + wcpfc.py (IUU blacklist)
+  - data/ccamlr_iuu.csv (transcribe from CCAMLR PDF)
+  - app/connectors/rfmo.py (RFMO CSV loader)
+  - app/connectors/psc.py (detention CSV loader)
+  - app/connectors/hsvar.py (FAO HSVAR CSV loader)
+  - app/connectors/sanctions.py (OpenSanctions JSON loader)
+  - app/tasks.py (task_ingest_blacklists, task_ingest_detentions)
+  - Load all available CSVs
+  - Rescore — verify blacklisted vessels are red
+  - Commit: "feat: IUU blacklists, RFMO, detentions, HSVAR, sanctions"
+
+PHASE 4 — Zones + Geographic Scoring (1 hour)
+  - app/connectors/zones.py (WFS + WDPA)
+  - app/routers/zones.py (GET /zones)
+  - Run zone ingest (FAO + high seas + any WDPA data)
+  - Rescore — verify geographic signals activate
+  - Commit: "feat: zone ingest, geographic scoring context"
+
+PHASE 5 — Reports (1 hour)
+  - app/templates/report.html (Jinja2 template)
+  - app/routers/reports.py (HTML + PDF)
+  - Verify report renders with all sections
+  - Commit: "feat: incident reports with full signal breakdown"
+
+PHASE 6 — Frontend (2 hours)
+  - web/index.html (page shell)
+  - web/style.css (dark theme)
+  - web/app.js (state, API, init, job polling)
+  - web/map.js (Mapbox layers, pulsing dots, trails, zones)
+  - web/panel.js (vessel list, detail panel, signals, stats)
+  - Verify full flow: load page -> see map + vessels -> click
+    vessel -> see detail -> download report -> reload ships
+  - Commit: "feat: frontend dashboard"
+
+PHASE 7 — GISIS Enrichment (1 hour)
+  - app/connectors/gisis.py (GISIS scraper)
+  - app/routers/jobs.py (POST /jobs/enrich)
+  - Test with 3-5 known IMO numbers
+  - Commit: "feat: GISIS ownership enrichment"
+
+PHASE 8 — Polish (1 hour)
+  - GET /stats endpoint
+  - Fleet stats bar in frontend
+  - Hard trigger rendering in detail panel
+  - IUU/detained badges on vessel cards
+  - tests/test_api.py, tests/test_connectors.py
+  - Commit: "feat: fleet stats, badges, tests"
+
+Total estimated build time: ~12 hours for one developer.
+
+
+================================================================
+13. DATA FILE FORMATS
+================================================================
+
+All manually maintained CSV files live in data/ and are committed
+to the repository. They are the source of truth for hard signals.
+
+13.1 data/ccamlr_iuu.csv
+  IMO,MMSI,vessel_name,flag_state,listed_date,reason
+  7436894,,MERIDIAN 1,KHM,2024-11-01,Fishing in CCAMLR area without authorization
+
+13.2 data/wcpfc_iuu.csv
+  IMO,MMSI,vessel_name,flag_state,listed_date,reason
+  (same format)
+
+13.3 data/detentions.csv
+  IMO,MMSI,vessel_name,flag_state,port,detained_date,released_date,deficiencies,source
+  9166981,,EXAMPLE,PA,Rotterdam,2025-06-15,2025-06-20,ISM deficiencies,PARIS_MOU
+
+13.4 data/fao_hsvar.csv
+  IMO,MMSI,vessel_name,flag_state,authorization,area,valid_from,valid_to
+
+
+================================================================
+14. ENVIRONMENT VARIABLES
+================================================================
+
+  DATABASE_URL              PostgreSQL async connection string
+  REDIS_URL                 Redis connection string
+  GFW_API_KEY               Global Fishing Watch bearer token
+  IMO_GISIS_USERNAME        IMO web account (optional, for GISIS)
+  IMO_GISIS_PASSWORD        IMO web account (optional, for GISIS)
+  OPENSANCTIONS_PATH        Path to opensanctions.json
+  MAPBOX_TOKEN              Mapbox GL access token
+  LOG_LEVEL                 Python log level (default: INFO)
+
+
+================================================================
+END OF DOCUMENT
+================================================================
