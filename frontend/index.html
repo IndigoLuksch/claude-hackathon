@@ -689,13 +689,30 @@
     }
   }
 
-  function selectVessel(mmsi) {
+  async function selectVessel(mmsi) {
     state.selectedMmsi = mmsi;
     const vessel = state.vessels.find(v => v.mmsi === mmsi);
     if (!vessel) return;
+
+    // Try most_recent_event first
+    let lon = null, lat = null;
     const pos = vessel.most_recent_event;
     if (pos && pos.lon != null && pos.lat != null) {
-      map.flyTo({ center: [pos.lon, pos.lat], zoom: Math.max(map.getZoom(), 6), speed: 1.4 });
+      lon = pos.lon; lat = pos.lat;
+    } else {
+      // Fallback: fetch latest events with coordinates
+      try {
+        const res = await fetch(`${API_BASE}/vessels/${encodeURIComponent(mmsi)}/events?limit=10`);
+        if (res.ok) {
+          const events = await res.json();
+          const located = events.find(e => e.lat != null && e.lon != null);
+          if (located) { lon = located.lon; lat = located.lat; }
+        }
+      } catch (_) {}
+    }
+
+    if (lon != null && lat != null && map) {
+      map.flyTo({ center: [lon, lat], zoom: Math.max(map.getZoom(), 6), speed: 1.4 });
     }
     renderDetails(vessel);
   }
