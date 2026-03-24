@@ -412,6 +412,17 @@ async def main() -> None:
             await upsert_events(session, event_rows)
             log.info("Upserted %d events", len(event_rows))
 
+    # Score all vessels now that events are loaded
+    from app.scoring import score_and_persist
+
+    async with AsyncSession() as session:
+        async with session.begin():
+            mmsi_list = [r["mmsi"] for r in vessel_rows]
+            log.info("Scoring %d vessels…", len(mmsi_list))
+            for mmsi in mmsi_list:
+                await score_and_persist(mmsi, session)
+            log.info("Scoring complete.")
+
     await engine.dispose()
     log.info("GFW ingest complete.")
 
