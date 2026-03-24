@@ -293,6 +293,14 @@ async def score_and_persist(mmsi: str, db: AsyncSession) -> tuple[float, str]:
 
     score = min(pts, 100.0)
 
+    # Hard triggers per SYSTEMS_OVERVIEW §4.5
+    if vessel.iuu_blacklisted:
+        score = max(score, 80.0)
+    if vessel.detained_24m:
+        score = max(score, 60.0)
+
+    score = min(score, 100.0)
+
     if score >= 80:
         tier = "red"
     elif score >= 60:
