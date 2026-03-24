@@ -592,7 +592,7 @@
     btn.textContent = "Fetching…";
     sub.textContent = "Pulling new vessels from GFW…";
     try {
-      const res = await fetch(`${API_BASE}/ingest`, { method: "POST" });
+      const res = await fetch(`${API_BASE}/ingest?limit=20`, { method: "POST" });
       const data = await res.json();
       if (data.status === "ok") {
         sub.textContent = `Loaded ${data.vessels} vessels — last updated ${new Date().toLocaleTimeString()}`;
