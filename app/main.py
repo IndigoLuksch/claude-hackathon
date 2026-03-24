@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from app.database import init_db
+from app.routers import ai
 from app.routers import ingest
 from app.routers import mpa
 from app.routers import vessels
@@ -40,6 +41,7 @@ async def get_config():
     return {"mapbox_token": os.getenv("MAPBOX_TOKEN", "")}
 
 
+app.include_router(ai.router)
 app.include_router(ingest.router)
 app.include_router(vessels.router)
 app.include_router(scoring.router)

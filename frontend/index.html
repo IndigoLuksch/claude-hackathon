@@ -156,6 +156,97 @@
     .event-item p { margin: 2px 0; font-size: 12px; color: var(--muted); }
     .event-item strong { color: var(--text); }
     .mapboxgl-popup-content { background: #111823; color: var(--text); border: 1px solid var(--border); }
+
+    /* AI Brief & Chat */
+    .ai-brief {
+      background: linear-gradient(135deg, #0d1f3c 0%, #162240 100%);
+      border: 1px solid #1a6aff44;
+      border-radius: 10px;
+      padding: 12px;
+      margin-bottom: 14px;
+      font-size: 12px;
+      line-height: 1.6;
+      color: var(--text);
+      max-height: 300px;
+      overflow-y: auto;
+      scrollbar-color: var(--border) transparent;
+      scrollbar-width: thin;
+    }
+    .ai-brief h4 { margin: 0 0 8px; color: var(--accent); font-size: 13px; display: flex; align-items: center; gap: 6px; }
+    .ai-brief .loading { color: var(--muted); font-style: italic; }
+    .ai-brief strong { color: #7eb8ff; }
+    .ai-brief ul { margin: 4px 0; padding-left: 16px; }
+    .ai-brief li { margin: 2px 0; }
+
+    .chat-box {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      display: flex;
+      flex-direction: column;
+      max-height: 350px;
+      margin-bottom: 14px;
+    }
+    .chat-header {
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--border);
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--accent);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .chat-messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 8px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      min-height: 100px;
+      max-height: 220px;
+      scrollbar-color: var(--border) transparent;
+      scrollbar-width: thin;
+    }
+    .chat-msg {
+      font-size: 12px;
+      line-height: 1.5;
+      padding: 6px 10px;
+      border-radius: 8px;
+      max-width: 90%;
+    }
+    .chat-msg.user { background: #1a6aff33; align-self: flex-end; color: var(--text); }
+    .chat-msg.assistant { background: #1f2937; align-self: flex-start; color: var(--text); }
+    .chat-input-row {
+      display: flex;
+      gap: 6px;
+      padding: 8px;
+      border-top: 1px solid var(--border);
+    }
+    .chat-input {
+      flex: 1;
+      background: #0d1117;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px 10px;
+      color: var(--text);
+      font-size: 12px;
+      outline: none;
+    }
+    .chat-input:focus { border-color: var(--accent); }
+    .chat-send {
+      background: var(--accent);
+      border: none;
+      border-radius: 6px;
+      padding: 8px 14px;
+      color: #fff;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .chat-send:hover { background: #1558e0; }
+    .chat-send:disabled { opacity: 0.4; cursor: default; }
   </style>
 </head>
 <body>
@@ -412,11 +503,27 @@
     map.on("mouseleave", "vessels-circles", () => { map.getCanvas().style.cursor = ""; });
   }
 
+  // Markdown-lite renderer (bold, bullets, headings)
+  function renderMd(text) {
+    return text
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+      .replace(/^### (.+)$/gm, '<div style="font-weight:700;margin:8px 0 4px;color:#7eb8ff;">$1</div>')
+      .replace(/^## (.+)$/gm, '<div style="font-weight:700;margin:10px 0 4px;color:#7eb8ff;font-size:13px;">$1</div>')
+      .replace(/^- (.+)$/gm, '<div style="padding-left:12px;">• $1</div>')
+      .replace(/^\d+\.\s+(.+)$/gm, '<div style="padding-left:12px;">$&</div>')
+      .replace(/\n/g, "<br>");
+  }
+
+  // Chat state per vessel
+  let chatHistory = [];
+
   async function renderDetails(v) {
     const panel = document.getElementById("details");
     const ringColor = tierColor(v.alert_tier || "clear");
     const score = Math.max(0, Math.min(100, Number(v.risk_score) || 0));
     const deg = Math.round((score / 100) * 360);
+    chatHistory = [];
 
     let events = [], signals = [];
     try {
@@ -446,6 +553,23 @@
           <div style="font-size:24px;font-weight:700;">${score.toFixed(1)}</div>
         </div>
       </div>
+
+      <div class="ai-brief" id="ai-brief">
+        <h4>AI Intelligence Brief</h4>
+        <div class="loading">Generating analysis...</div>
+      </div>
+
+      <div class="chat-box" id="chat-box">
+        <div class="chat-header">Ask the Analyst</div>
+        <div class="chat-messages" id="chat-messages">
+          <div class="chat-msg assistant">I've analyzed this vessel. Ask me anything — risk patterns, recommended actions, regulatory context.</div>
+        </div>
+        <div class="chat-input-row">
+          <input class="chat-input" id="chat-input" placeholder="Ask about this vessel..." />
+          <button class="chat-send" id="chat-send" onclick="sendChat('${v.mmsi}')">Send</button>
+        </div>
+      </div>
+
       <div class="actions">
         <a class="btn" href="${API_BASE}/report/${encodeURIComponent(v.mmsi)}" target="_blank" rel="noreferrer">Download Incident Report</a>
         <a class="btn" href="${API_BASE}/report/${encodeURIComponent(v.mmsi)}/html" target="_blank" rel="noreferrer">Preview Report</a>
@@ -455,6 +579,14 @@
       <h3 style="font-size:14px;margin:12px 0 8px;">Recent Events</h3>
       <div class="events" id="recent-events"></div>
     `;
+
+    // Enter key sends chat
+    document.getElementById("chat-input").addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendChat(v.mmsi); }
+    });
+
+    // Load AI brief asynchronously
+    loadAiBrief(v.mmsi);
 
     const sigList = panel.querySelector("#risk-signals");
     if (signals.length) {
@@ -480,6 +612,80 @@
         <p>Lat: ${e.lat ?? "-"} · Lon: ${e.lon ?? "-"}</p>
       </div>
     `).join("");
+  }
+
+  async function loadAiBrief(mmsi) {
+    const el = document.getElementById("ai-brief");
+    if (!el) return;
+    try {
+      const res = await fetch(`${API_BASE}/ai/brief/${encodeURIComponent(mmsi)}`, { method: "POST" });
+      if (!res.ok) throw new Error("Brief failed");
+      const data = await res.json();
+      el.innerHTML = `<h4>AI Intelligence Brief</h4>${renderMd(data.brief)}`;
+    } catch (err) {
+      el.innerHTML = `<h4>AI Intelligence Brief</h4><div class="loading">Unable to generate brief.</div>`;
+    }
+  }
+
+  async function sendChat(mmsi) {
+    const input = document.getElementById("chat-input");
+    const btn = document.getElementById("chat-send");
+    const messages = document.getElementById("chat-messages");
+    const text = input.value.trim();
+    if (!text) return;
+
+    // Add user message
+    chatHistory.push({ role: "user", content: text });
+    messages.innerHTML += `<div class="chat-msg user">${text.replace(/</g,"&lt;")}</div>`;
+    input.value = "";
+    btn.disabled = true;
+
+    // Add placeholder for assistant
+    const assistantDiv = document.createElement("div");
+    assistantDiv.className = "chat-msg assistant";
+    assistantDiv.textContent = "Thinking...";
+    messages.appendChild(assistantDiv);
+    messages.scrollTop = messages.scrollHeight;
+
+    try {
+      const res = await fetch(`${API_BASE}/ai/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mmsi, messages: chatHistory }),
+      });
+
+      if (!res.ok) throw new Error("Chat failed");
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let fullText = "";
+      assistantDiv.textContent = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = decoder.decode(value);
+        const lines = chunk.split("\n");
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          const payload = line.slice(6).trim();
+          if (payload === "[DONE]") continue;
+          try {
+            const parsed = JSON.parse(payload);
+            fullText += parsed.text;
+            assistantDiv.innerHTML = renderMd(fullText);
+            messages.scrollTop = messages.scrollHeight;
+          } catch (_) {}
+        }
+      }
+
+      chatHistory.push({ role: "assistant", content: fullText });
+    } catch (err) {
+      assistantDiv.textContent = "Error: could not reach AI analyst.";
+    } finally {
+      btn.disabled = false;
+      input.focus();
+    }
   }
 
   function selectVessel(mmsi) {
