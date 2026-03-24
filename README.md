@@ -8,7 +8,7 @@ DarkFleet consolidates **7 data sources** into a unified risk-scoring dashboard,
 
 > Built at the **Claude Hackathon @ Imperial College London**
 
-![DarkFleet Screenshot](docs/screenshots/dashboard.png)
+![DarkFleet Globe Overview](docs/screenshots/globe-overview.png)
 
 ---
 
@@ -79,10 +79,15 @@ sequenceDiagram
 
 ## Screenshots
 
-<!-- Add your screenshots here -->
-<!-- ![Globe View](docs/screenshots/globe.png) -->
-<!-- ![Vessel Detail + AI Brief](docs/screenshots/detail.png) -->
-<!-- ![Risk Signals](docs/screenshots/signals.png) -->
+### Red Alert — AI Intelligence Brief
+Select a high-risk vessel to get a Claude-generated intelligence assessment with key risk factors and recommended actions.
+
+![Red Alert Vessel Detail](docs/screenshots/vessel-detail-red.png)
+
+### Amber Alert — Risk Signals Breakdown
+Drill into individual risk signals: loitering events, RFMO status, flag changes, and more.
+
+![Amber Alert Risk Signals](docs/screenshots/vessel-detail-amber.png)
 
 ---
 
