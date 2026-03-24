@@ -321,9 +321,11 @@
         color: "rgb(10, 14, 20)",
         "high-color": "rgb(20, 30, 60)",
         "horizon-blend": 0.08,
-        "space-color": "rgb(8, 10, 16)",
+        "space-color": "rgb(11, 15, 26)",
         "star-intensity": 0.4
       });
+      // Make water visible on the dark globe
+      map.setPaintProperty("water", "fill-color", "#0a1e3d");
     });
 
     map.on("load", async () => {
@@ -810,9 +812,62 @@
   }
 
   async function loadMpaZones() {
-    const res = await fetch(`${API_BASE}/mpa`);
-    if (!res.ok) return;
-    const geojson = await res.json();
+    console.log("[MPA] Fetching MPA zones from API...");
+    let geojson;
+    try {
+      const res = await fetch(`${API_BASE}/mpa`);
+      if (!res.ok) {
+        console.warn("[MPA] API returned status", res.status);
+        geojson = null;
+      } else {
+        geojson = await res.json();
+        console.log("[MPA] API returned", geojson?.features?.length ?? 0, "features");
+      }
+    } catch (err) {
+      console.warn("[MPA] Fetch error:", err);
+      geojson = null;
+    }
+
+    // Fallback: if API returned no features, use hardcoded well-known MPAs
+    if (!geojson || !geojson.features || geojson.features.length === 0) {
+      console.log("[MPA] Using hardcoded fallback MPA zones");
+      geojson = {
+        type: "FeatureCollection",
+        features: [
+          {
+            type: "Feature",
+            properties: { name: "Galapagos Marine Reserve" },
+            geometry: { type: "Polygon", coordinates: [[[-92, -1.5], [-89, -1.5], [-89, 0.5], [-92, 0.5], [-92, -1.5]]] }
+          },
+          {
+            type: "Feature",
+            properties: { name: "Great Barrier Reef" },
+            geometry: { type: "Polygon", coordinates: [[[142, -24], [154, -24], [154, -10], [142, -10], [142, -24]]] }
+          },
+          {
+            type: "Feature",
+            properties: { name: "Chagos Archipelago" },
+            geometry: { type: "Polygon", coordinates: [[[70, -8], [73, -8], [73, -4], [70, -4], [70, -8]]] }
+          },
+          {
+            type: "Feature",
+            properties: { name: "Papahanaumokuakea" },
+            geometry: { type: "Polygon", coordinates: [[[-180, 22], [-170, 22], [-170, 30], [-180, 30], [-180, 22]]] }
+          },
+          {
+            type: "Feature",
+            properties: { name: "Ross Sea" },
+            geometry: { type: "Polygon", coordinates: [[[160, -78], [180, -78], [180, -70], [160, -70], [160, -78]]] }
+          },
+          {
+            type: "Feature",
+            properties: { name: "Phoenix Islands" },
+            geometry: { type: "Polygon", coordinates: [[[-176, -5], [-170, -5], [-170, 0], [-176, 0], [-176, -5]]] }
+          }
+        ]
+      };
+    }
+
     if (!map.getSource("mpa-zones")) {
       map.addSource("mpa-zones", { type: "geojson", data: geojson });
       map.addLayer({
@@ -821,7 +876,7 @@
         source: "mpa-zones",
         paint: {
           "fill-color": "#1a6aff",
-          "fill-opacity": 0.15
+          "fill-opacity": 0.22
         }
       });
       map.addLayer({
@@ -831,6 +886,23 @@
         paint: {
           "line-color": "#1a6aff",
           "line-width": 1.4
+        }
+      });
+      map.addLayer({
+        id: "mpa-labels",
+        type: "symbol",
+        source: "mpa-zones",
+        layout: {
+          "text-field": ["get", "name"],
+          "text-size": 12,
+          "text-anchor": "center",
+          "text-allow-overlap": false,
+          "text-font": ["DIN Pro Medium", "Arial Unicode MS Regular"]
+        },
+        paint: {
+          "text-color": "#7eb8ff",
+          "text-halo-color": "rgba(0,0,0,0.7)",
+          "text-halo-width": 1
         }
       });
     } else {
