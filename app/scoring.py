@@ -86,14 +86,6 @@ WHERE  e.vessel_mmsi = :mmsi
   AND  e.event_type  = 'GAP'
   AND  COALESCE((e.details_json -> 'gap' ->> 'durationHours')::float, 0) > 6
   AND  e.timestamp  >= NOW() - INTERVAL '12 months'
-  AND  EXISTS (
-      SELECT 1 FROM mpa_zones m
-      WHERE ST_DWithin(
-          m.geometry::geography,
-          ST_SetSRID(ST_MakePoint(e.lon, e.lat), 4326)::geography,
-          50000   -- 50 km
-      )
-  )
 """)
 
 _SQL_LOITER_COUNT_MPA = text("""
@@ -101,15 +93,7 @@ SELECT COUNT(*)
 FROM   events e
 WHERE  e.vessel_mmsi = :mmsi
   AND  e.event_type  = 'LOITERING'
-  AND  COALESCE((e.details_json -> 'loitering' ->> 'totalTimeHours')::float, 0) > 2
   AND  e.timestamp  >= NOW() - INTERVAL '12 months'
-  AND  EXISTS (
-      SELECT 1 FROM mpa_zones m
-      WHERE ST_Within(
-          ST_SetSRID(ST_MakePoint(e.lon, e.lat), 4326),
-          m.geometry
-      )
-  )
 """)
 
 _SQL_ENCOUNTER_COUNT = text("""
